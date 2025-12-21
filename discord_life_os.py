@@ -5,7 +5,13 @@ import datetime
 import os
 from dotenv import load_dotenv
 
+from zoneinfo import ZoneInfo
+
+
 # ---------- CONFIG ----------
+TZ = ZoneInfo("Europe/Paris")
+
+
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
@@ -23,6 +29,9 @@ TODO_CHANNEL = "todo"
 DONE_CHANNEL = "done"
 
 CHECKIN_HOUR = 6   # 08:00
+CHECKIN_MINUTE = 45
+
+
 RESET_HOUR = 23    # 23:00
 # ----------------------------
 
@@ -74,16 +83,30 @@ async def on_ready():
     monthly_summary.start()
 
 # ---------- DAILY CHECKIN ----------
+last_checkin_date = None
+
 @tasks.loop(minutes=1)
 async def daily_checkin():
-    now_time = datetime.datetime.now()
-    if now_time.hour == CHECKIN_HOUR and now_time.minute == 40:
-        channel = discord.utils.get(bot.get_all_channels(), name=CHECKIN_CHANNEL)
+    global last_checkin_date
+
+    now = datetime.datetime.now(TZ)
+    today = now.date()
+
+    if (
+        now.hour == CHECKIN_HOUR
+        and now.minute == CHECKIN_MINUTE
+        and last_checkin_date != today
+    ):
+        last_checkin_date = today
+
+        channel = discord.utils.get(
+            bot.get_all_channels(), name=CHECKIN_CHANNEL
+        )
         if not channel:
             return
 
         msg = await channel.send(
-            f"☀️ **Daily Check-in — {today()}**\n\n"
+            f"☀️ **Daily Check-in — {today}**\n\n"
             "React when completed:\n"
             "🚶‍♂️ Morning walk + water\n"
             "🪥 Brush teeth\n"
@@ -92,6 +115,7 @@ async def daily_checkin():
 
         for emoji in HABITS:
             await msg.add_reaction(emoji)
+
 
 # ---------- REACTION TRACKING ----------
 @bot.event
@@ -127,6 +151,14 @@ async def log_habit(habit, completed):
         f"{status} **{today()}** — {habit}\n"
         f"🔥 Streak: {streak} days"
     )
+
+
+async def delete_last_bot_message(channel: discord.TextChannel):
+    async for message in channel.history(limit=10):
+        if message.author == bot.user:
+            await message.delete()
+            break
+
 
 def get_streak(habit):
     cursor.execute("""
@@ -186,6 +218,11 @@ async def weekly_summary():
 
             report += f"{emoji} **{habit.capitalize()}**: {count} / 7  {bar}\n"
 
+        channel = discord.utils.get(bot.get_all_channels(), name=WEEKLY_CHANNEL)
+        if not channel:
+            return
+
+        await delete_last_bot_message(channel)
 
         await channel.send(report)
 
@@ -219,6 +256,8 @@ async def monthly_summary():
                 f"{count} / {days_in_month}  {bar}\n"
     )
 
+
+        await delete_last_bot_message(channel)
 
         await channel.send(report)
 
