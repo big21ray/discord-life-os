@@ -28,8 +28,10 @@ MONTHLY_CHANNEL = "monthly-summary"
 TODO_CHANNEL = "todo"
 DONE_CHANNEL = "done"
 
-CHECKIN_HOUR = 6   # 08:00
-CHECKIN_MINUTE = 49
+CHECKIN_HOUR = 7   # 08:00
+CHECKIN_MINUTE = 00
+
+TODO_REMINDER_OFFSET_MIN = 00
 
 
 RESET_HOUR = 23    # 23:00
@@ -63,6 +65,12 @@ CREATE TABLE IF NOT EXISTS todos (
     completed_at TEXT
 )
 """)
+
+cursor.execute("""
+ALTER TABLE todos ADD COLUMN deadline TEXT
+""")
+db.commit()
+
 
 db.commit()
 # ----------------------------
@@ -116,6 +124,46 @@ async def daily_checkin():
         for emoji in HABITS:
             await msg.add_reaction(emoji)
 
+last_todo_ping_date = None
+
+@tasks.loop(minutes=1)
+async def daily_todo_reminder():
+    global last_todo_ping_date
+
+    now = datetime.datetime.now(TZ)
+    today = now.date()
+
+    target_time = (
+        datetime.datetime
+        .combine(today, datetime.time(CHECKIN_HOUR, CHECKIN_MINUTE), tzinfo=TZ)
+        + datetime.timedelta(minutes=TODO_REMINDER_OFFSET_MIN)
+    )
+
+    if now >= target_time and last_todo_ping_date != today:
+        last_todo_ping_date = today
+
+        cursor.execute("""
+        SELECT content, deadline FROM todos
+        WHERE status = 'pending'
+        """)
+        todos = cursor.fetchall()
+
+        if not todos:
+            return
+
+        channel = discord.utils.get(bot.get_all_channels(), name=TODO_CHANNEL)
+        if not channel:
+            return
+
+        msg = "📝 **Today's Todos**\n\n"
+        for content, deadline in todos:
+            if deadline:
+                msg += f"• {content} _(due {deadline})_\n"
+            else:
+                msg += f"• {content}\n"
+
+        await channel.send(msg)
+
 
 # ---------- REACTION TRACKING ----------
 @bot.event
@@ -138,6 +186,26 @@ async def on_reaction_add(reaction, user):
     db.commit()
 
     await log_habit(habit, True)
+
+    if (
+        reaction.message.channel.name == TODO_CHANNEL
+        and reaction.emoji == "✅"
+    ):
+        content = reaction.message.content
+
+        cursor.execute("""
+        UPDATE todos
+        SET status = 'done', completed_at = ?
+        WHERE content = ? AND status = 'pending'
+        """, (now(), content))
+        db.commit()
+
+        done_channel = discord.utils.get(
+            bot.get_all_channels(), name=DONE_CHANNEL
+        )
+
+        await done_channel.send(f"✅ {content}")
+
 
 async def log_habit(habit, completed):
     channel = discord.utils.get(bot.get_all_channels(), name=HABIT_LOG_CHANNEL)
@@ -178,6 +246,21 @@ def get_streak(habit):
         else:
             break
     return streak
+
+def parse_todo_message(text: str):
+    if "| due" not in text.lower():
+        return text.strip(), None
+
+    content, due = text.split("|", 1)
+    due = due.replace("due", "").strip()
+
+    try:
+        deadline = datetime.datetime.fromisoformat(due).date().isoformat()
+    except Exception:
+        deadline = None
+
+    return content.strip(), deadline
+
 
 # ---------- DAILY RESET ----------
 @tasks.loop(minutes=1)
@@ -268,12 +351,16 @@ async def on_message(message):
         return
 
     if message.channel.name == TODO_CHANNEL:
+        content, deadline = parse_todo_message(message.content)
+
         cursor.execute("""
-        INSERT INTO todos (content, status, created_at)
-        VALUES (?, 'pending', ?)
-        """, (message.content, now()))
+        INSERT INTO todos (content, status, created_at, deadline)
+        VALUES (?, 'pending', ?, ?)
+        """, (content, now(), deadline))
         db.commit()
+
         await message.add_reaction("⏳")
+
 
     await bot.process_commands(message)
 
@@ -293,7 +380,5 @@ async def on_reaction_add(reaction, user):
         await done_channel.send(f"✅ {reaction.message.content}")
 
 # ---------- RUN ----------
-
-print("NOW (Paris):", datetime.datetime.now(TZ))
 
 bot.run(TOKEN)
