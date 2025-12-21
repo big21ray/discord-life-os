@@ -22,7 +22,7 @@ MONTHLY_CHANNEL = "monthly-summary"
 TODO_CHANNEL = "todo"
 DONE_CHANNEL = "done"
 
-CHECKIN_HOUR = 8   # 08:00
+CHECKIN_HOUR = 6   # 08:00
 RESET_HOUR = 23    # 23:00
 # ----------------------------
 
@@ -77,7 +77,7 @@ async def on_ready():
 @tasks.loop(minutes=1)
 async def daily_checkin():
     now_time = datetime.datetime.now()
-    if now_time.hour == CHECKIN_HOUR and now_time.minute == 0:
+    if now_time.hour == CHECKIN_HOUR and now_time.minute == 40:
         channel = discord.utils.get(bot.get_all_channels(), name=CHECKIN_CHANNEL)
         if not channel:
             return
