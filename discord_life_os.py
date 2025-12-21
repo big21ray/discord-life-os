@@ -173,15 +173,19 @@ async def weekly_summary():
             return
 
         start = datetime.date.today() - datetime.timedelta(days=6)
-
         report = "📊 **Weekly Habit Report**\n\n"
-        for habit in HABITS.values():
+
+        for emoji, habit in HABITS.items():
             cursor.execute("""
             SELECT COUNT(*) FROM habits
             WHERE habit = ? AND completed = 1 AND date >= ?
             """, (habit, start.isoformat()))
             count = cursor.fetchone()[0]
-            report += f"**{habit}**: {count}/7\n"
+
+            bar = "█" * count + "░" * (7 - count)
+
+            report += f"{emoji} **{habit.capitalize()}**: {count} / 7  {bar}\n"
+
 
         await channel.send(report)
 
@@ -197,14 +201,24 @@ async def monthly_summary():
         month_start = today_date.replace(day=1) - datetime.timedelta(days=1)
         month_start = month_start.replace(day=1)
 
-        report = f"📅 **Monthly Summary — {month_start.strftime('%B')}**\n\n"
-        for habit in HABITS.values():
+        report = f"📅 **Monthly Habit Report — {today.strftime('%B')}**\n\n"
+
+        for emoji, habit in HABITS.items():
             cursor.execute("""
             SELECT COUNT(*) FROM habits
             WHERE habit = ? AND completed = 1 AND date >= ?
             """, (habit, month_start.isoformat()))
             count = cursor.fetchone()[0]
-            report += f"**{habit}**: {count} completions\n"
+
+            # Scale bar to max 10 blocks for readability
+            filled = round((count / days_in_month) * 10) if days_in_month else 0
+            bar = "█" * filled + "░" * (10 - filled)
+
+            report += (
+                f"{emoji} **{habit.capitalize()}**: "
+                f"{count} / {days_in_month}  {bar}\n"
+    )
+
 
         await channel.send(report)
 
