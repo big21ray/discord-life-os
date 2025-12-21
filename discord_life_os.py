@@ -293,4 +293,7 @@ async def on_reaction_add(reaction, user):
         await done_channel.send(f"✅ {reaction.message.content}")
 
 # ---------- RUN ----------
+
+print("NOW (Paris):", datetime.datetime.now(TZ))
+
 bot.run(TOKEN)
