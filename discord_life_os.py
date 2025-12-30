@@ -82,7 +82,7 @@ def init_google_sheets():
             creds_dict = json.loads(creds_json)
             creds = Credentials.from_service_account_info(creds_dict, scopes=SHEETS_SCOPES)
         else:
-            # Fall back to local file
+            # Fall back to local file for development
             creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SHEETS_SCOPES)
         SHEETS_CLIENT = gspread.authorize(creds)
         
@@ -218,7 +218,7 @@ def init_google_calendar():
             creds_dict = json.loads(creds_json)
             credentials = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
         else:
-            # Fall back to local file
+            # Fall back to local file for development
             credentials = Credentials.from_service_account_file(
                 "credentials.json", scopes=SCOPES
             )
