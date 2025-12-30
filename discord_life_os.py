@@ -57,7 +57,6 @@ CALENDAR_SERVICE = None
 # Google Sheets
 SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 SHEET_ID = os.getenv("GOOGLE_SHEETS_ID")
-CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "google_credentials.json")
 SHEETS_CLIENT = None
 HABITS_SHEET = None
 TODOS_SHEET = None
@@ -81,9 +80,14 @@ def init_google_sheets():
             import json
             creds_dict = json.loads(creds_json)
             creds = Credentials.from_service_account_info(creds_dict, scopes=SHEETS_SCOPES)
-        else:
+        elif os.path.exists("google_credentials.json"):
             # Fall back to local file for development
-            creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SHEETS_SCOPES)
+            creds = Credentials.from_service_account_file("google_credentials.json", scopes=SHEETS_SCOPES)
+        else:
+            raise FileNotFoundError(
+                "❌ GOOGLE_CREDENTIALS not set and google_credentials.json not found. "
+                "Please add GOOGLE_CREDENTIALS to your environment variables or place google_credentials.json in the project root."
+            )
         SHEETS_CLIENT = gspread.authorize(creds)
         
         # Open the spreadsheet
