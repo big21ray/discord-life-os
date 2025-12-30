@@ -72,6 +72,9 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# Track if tasks have been started
+_tasks_started = False
+
 # ---------- GOOGLE SHEETS FUNCTIONS ----------
 def init_google_sheets():
     """Initialize Google Sheets connection"""
@@ -566,7 +569,7 @@ def add_calendar_event(calendar_id, title, event_datetime):
 # ---------- BOT EVENTS ----------
 @bot.event
 async def on_ready():
-    global CALENDAR_SERVICE
+    global CALENDAR_SERVICE, _tasks_started
     print(f"✅ Logged in as {bot.user}")
     
     # Initialize Google Sheets
@@ -582,16 +585,17 @@ async def on_ready():
     except Exception as e:
         print(f"⚠️ Google Calendar API failed: {e}")
     
-    daily_checkin.start()
-    daily_reset.start()
-    weekly_summary.start()
-    monthly_summary.start()
-    if not event_reminders.is_running():
+    # Start tasks only once on first boot
+    if not _tasks_started:
+        _tasks_started = True
+        daily_checkin.start()
+        daily_reset.start()
+        weekly_summary.start()
+        monthly_summary.start()
         event_reminders.start()
-    if not daily_calendar_notification.is_running():
         daily_calendar_notification.start()
-    if not weekly_calendar_summary.is_running():
         weekly_calendar_summary.start()
+        print("✅ All tasks started")
     event_reminders.start()
 
 # ---------- DAILY CHECKIN ----------
