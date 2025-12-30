@@ -586,6 +586,7 @@ async def on_ready():
     daily_reset.start()
     weekly_summary.start()
     monthly_summary.start()
+    event_reminders.start()
     daily_calendar_notification.start()
     weekly_calendar_summary.start()
     event_reminders.start()
@@ -758,25 +759,96 @@ async def weekly_summary():
 last_calendar_date = None
 last_weekly_calendar_date = None
 
+# ---------- CALENDAR EVENT REMINDERS ----------
+# Track sent reminders to avoid duplicates (format: "event_id_2h" or "event_id_1h" or "event_id_5min")
+sent_reminders = {}
+
 @tasks.loop(minutes=1)
+async def event_reminders():
+    """Send reminders 2h, 1h, and 5min before events"""
+    global sent_reminders
+    
+    now = datetime.datetime.now(TZ)
+    channel = discord.utils.get(bot.get_all_channels(), name=CALENDAR_CHANNEL)
+    
+    if not channel:
+        return
+    
+    # Clean up old reminders (older than 6 hours)
+    cutoff_time = now - datetime.timedelta(hours=6)
+    expired_keys = [k for k, v in sent_reminders.items() if v < cutoff_time]
+    for key in expired_keys:
+        del sent_reminders[key]
+    
+    # Check personal calendar
+    personal_events = get_calendar_events(PERSONAL_CALENDAR_ID, days_ahead=1)
+    for event in personal_events:
+        await check_and_send_reminder(event, "personal", "📅", channel, now)
+    
+    # Check professional calendar if configured
+    if PROFESSIONAL_CALENDAR_ID:
+        professional_events = get_calendar_events(PROFESSIONAL_CALENDAR_ID, days_ahead=1)
+        for event in professional_events:
+            await check_and_send_reminder(event, "professional", "💼", channel, now)
+
+async def check_and_send_reminder(event, calendar_type, calendar_emoji, channel, now):
+    """Check if event needs a reminder and send it"""
+    try:
+        start = event.get("start", {})
+        start_time_str = start.get("dateTime", start.get("date"))
+        
+        # Skip all-day events
+        if "T" not in start_time_str:
+            return
+        
+        event_time = dateutil.parser.parse(start_time_str)
+        time_until_seconds = (event_time - now).total_seconds()
+        time_until_minutes = time_until_seconds / 60
+        
+        event_id = event.get("id", "")
+        title = event.get("summary", "Untitled")
+        time_str = event_time.strftime("%H:%M")
+        
+        # Define reminder triggers: (minutes_before, label, emoji)
+        reminders = [
+            (120, "2h", "🕐"),
+            (60, "1h", "⏰"),
+            (5, "5min", "🔔")
+        ]
+        
+        for minutes_threshold, label, emoji in reminders:
+            # Check if within 1 minute window of reminder time
+            if minutes_threshold - 1 <= time_until_minutes <= minutes_threshold:
+                reminder_key = f"{event_id}_{label}"
+                
+                # Only send if not already sent
+                if reminder_key not in sent_reminders:
+                    sent_reminders[reminder_key] = now
+                    
+                    msg = f"{emoji} **{label}** until event\n{calendar_emoji} **{calendar_type.upper()}**\n📌 **{title}**\n⏰ {time_str}"
+                    await channel.send(msg)
+    except Exception as e:
+        print(f"Error checking reminder: {e}")
+
+@tasks.loop(hours=1)
 async def daily_calendar_notification():
-    """Send calendar events for next 2 days at 9:00 AM"""
+    """Send daily summary of calendar events for next 2 days at 9:00 AM"""
     global last_calendar_date
     
     now = datetime.datetime.now(TZ)
     today = now.date()
     
     # Debug logging
-    if now.minute == 0:  # Log every hour
-        print(f"🕐 Calendar check: {now.strftime('%H:%M %Z')} | Last reminder: {last_calendar_date} | Today: {today}")
+    if now.minute == 0:
+        print(f"🕐 Daily calendar check: {now.strftime('%H:%M %Z')} | Today: {today}")
     
     if (
-        now.hour == CALENDAR_HOUR
-        and now.minute == CALENDAR_MINUTE
+        now.hour == CHECKIN_HOUR
+        and now.minute == CHECKIN_MINUTE
         and last_calendar_date != today
     ):
         last_calendar_date = today
-        print(f"✅ Sending calendar reminder at {now.strftime('%H:%M %Z')}")
+        print(f"✅ Sending daily calendar summary at {now.strftime('%H:%M %Z')}")
         
         channel = discord.utils.get(bot.get_all_channels(), name=CALENDAR_CHANNEL)
         if not channel:
