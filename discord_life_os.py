@@ -766,15 +766,21 @@ async def daily_calendar_notification():
     now = datetime.datetime.now(TZ)
     today = now.date()
     
+    # Debug logging
+    if now.minute == 0:  # Log every hour
+        print(f"🕐 Calendar check: {now.strftime('%H:%M %Z')} | Last reminder: {last_calendar_date} | Today: {today}")
+    
     if (
         now.hour == CALENDAR_HOUR
         and now.minute == CALENDAR_MINUTE
         and last_calendar_date != today
     ):
         last_calendar_date = today
+        print(f"✅ Sending calendar reminder at {now.strftime('%H:%M %Z')}")
         
         channel = discord.utils.get(bot.get_all_channels(), name=CALENDAR_CHANNEL)
         if not channel:
+            print(f"❌ Channel '{CALENDAR_CHANNEL}' not found")
             return
         
         # Get events from both calendars
@@ -800,6 +806,10 @@ async def weekly_calendar_summary():
     now = datetime.datetime.now(TZ)
     today = now.date()
     
+    # Debug logging (every Monday at 8 AM)
+    if today.weekday() == 0 and now.hour == 8:
+        print(f"🕐 Weekly calendar check: {now.strftime('%H:%M %Z')} Monday={today.weekday()} | Last: {last_weekly_calendar_date}")
+    
     # Monday = 0, check if today is Monday and time is 9:00 AM
     if (
         today.weekday() == 0  # Monday
@@ -808,9 +818,11 @@ async def weekly_calendar_summary():
         and last_weekly_calendar_date != today
     ):
         last_weekly_calendar_date = today
+        print(f"✅ Sending weekly calendar reminder at {now.strftime('%H:%M %Z')}")
         
         channel = discord.utils.get(bot.get_all_channels(), name=CALENDAR_CHANNEL)
         if not channel:
+            print(f"❌ Channel '{CALENDAR_CHANNEL}' not found")
             return
         
         # Get events from both calendars for next 14 days
