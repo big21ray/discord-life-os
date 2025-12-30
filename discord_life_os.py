@@ -38,8 +38,8 @@ CHECKIN_MINUTE = 30
 
 TODO_REMINDER_OFFSET_MIN = 00
 
-CALENDAR_HOUR = 9  # 09:00 for daily calendar notifications
-CALENDAR_MINUTE = 0
+CALENDAR_HOUR = 9  # 09:30 for daily calendar notifications
+CALENDAR_MINUTE = 30
 
 RESET_HOUR = 22    # 22:30 (10:30 PM)
 RESET_MINUTE = 30
@@ -60,6 +60,9 @@ SHEET_ID = os.getenv("GOOGLE_SHEETS_ID")
 SHEETS_CLIENT = None
 HABITS_SHEET = None
 TODOS_SHEET = None
+
+# Event reminder tracking (in-memory, resets on bot restart)
+sent_reminders = set()  # Format: "calendar_id|event_id|hours_before"
 # ----------------------------
 
 intents = discord.Intents.default()
@@ -103,8 +106,8 @@ def init_google_sheets():
         try:
             TODOS_SHEET = spreadsheet.worksheet("todos")
         except gspread.exceptions.WorksheetNotFound:
-            TODOS_SHEET = spreadsheet.add_worksheet(title="todos", rows=1000, cols=10)
-            TODOS_SHEET.append_row(["id", "content", "status", "created_at", "completed_at", "deadline", "type", "frequency", "next_due", "priority"])
+            TODOS_SHEET = spreadsheet.add_worksheet(title="todos", rows=1000, cols=11)
+            TODOS_SHEET.append_row(["id", "content", "status", "created_at", "completed_at", "deadline", "type", "frequency", "next_due", "priority", "tags"])
         
         print("✅ Google Sheets initialized successfully")
         return True
@@ -152,8 +155,8 @@ def get_habit_streak(habit):
         print(f"Error getting habit streak: {e}")
         return 0
 
-def get_todos(status=None):
-    """Get todos from Google Sheets"""
+def get_todos(status=None, tag=None):
+    """Get todos from Google Sheets, optionally filtered by status or tag"""
     try:
         all_todos = TODOS_SHEET.get_all_values()
         todos = []
@@ -162,24 +165,39 @@ def get_todos(status=None):
                 continue
             if status and row[2] != status:
                 continue
+            
+            # Parse tags
+            tags_str = row[10] if len(row) > 10 else ""
+            tags = [t.strip() for t in tags_str.split(",") if t.strip()]
+            
+            # Filter by tag if specified
+            if tag and tag not in tags:
+                continue
+            
             todos.append({
                 "id": row[0],
                 "content": row[1],
                 "status": row[2],
                 "created_at": row[3],
                 "completed_at": row[4] if len(row) > 4 else "",
-                "deadline": row[5] if len(row) > 5 else ""
+                "deadline": row[5] if len(row) > 5 else "",
+                "type": row[6] if len(row) > 6 else "one-time",
+                "frequency": row[7] if len(row) > 7 else "",
+                "next_due": row[8] if len(row) > 8 else "",
+                "priority": row[9] if len(row) > 9 else "medium",
+                "tags": tags
             })
         return todos
     except Exception as e:
         print(f"Error getting todos: {e}")
         return []
 
-def add_todo(content, deadline=None, todo_type="one-time", frequency=None, priority="medium"):
+def add_todo(content, deadline=None, todo_type="one-time", frequency=None, priority="medium", tags=None):
     """Add todo to Google Sheets"""
     try:
         todo_id = len(TODOS_SHEET.get_all_values())
         now_str = datetime.datetime.now().isoformat()
+        tags_str = ",".join(tags) if tags else ""
         
         TODOS_SHEET.append_row([
             str(todo_id),
@@ -191,7 +209,8 @@ def add_todo(content, deadline=None, todo_type="one-time", frequency=None, prior
             todo_type,
             frequency or "",
             "",  # next_due
-            priority
+            priority,
+            tags_str  # New tags column
         ])
     except Exception as e:
         print(f"Error adding todo: {e}")
@@ -210,6 +229,202 @@ def today_str():
 
 def now_str():
     return datetime.datetime.now().isoformat()
+
+# ---------- NATURAL LANGUAGE PARSER ----------
+def parse_todo_input(text):
+    """
+    Parse todo input with patterns like:
+    - "Book Scrims every-tuesday-21:00 tag:pro" → recurring weekly at 21:00 with pro tag
+    - "Do taxes in-2-weeks tag:perso" → one-time in 2 weeks with perso tag
+    - "Dentist appointment deadline:2025-02-28 tag:perso" → with deadline and tag
+    - "Daily exercise every-day tag:health" → daily recurring with custom tag
+    - Multiple tags: "task tag:pro tag:urgent"
+    """
+    import re
+    
+    result = {
+        "content": text.strip(),
+        "type": "one-time",
+        "frequency": None,
+        "next_due": None,
+        "deadline": None,
+        "priority": "medium",
+        "tags": []
+    }
+    
+    # Extract all tags: tag:word (case-insensitive)
+    tag_matches = re.findall(r'tag:(\w+)', text, re.IGNORECASE)
+    if tag_matches:
+        result["tags"] = [tag.lower() for tag in tag_matches]
+    
+    # Pattern 1: every-[day]-[time] (e.g., "every-tuesday-21:00")
+    every_day_time = re.search(r'every-(\w+)-(\d{1,2}):(\d{2})', text, re.IGNORECASE)
+    
+    # Pattern 1: every-[day]-[time] (e.g., "every-tuesday-21:00")
+    every_day_time = re.search(r'every-(\w+)-(\d{1,2}):(\d{2})', text, re.IGNORECASE)
+    if every_day_time:
+        day = every_day_time.group(1).lower()
+        hour = int(every_day_time.group(2))
+        minute = int(every_day_time.group(3))
+        
+        result["type"] = "recurring"
+        result["frequency"] = f"every-{day.capitalize()}-{hour:02d}:{minute:02d}"
+        
+        # Calculate next occurrence
+        days_map = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3, 
+                   "friday": 4, "saturday": 5, "sunday": 6}
+        target_day = days_map.get(day, None)
+        
+        if target_day is not None:
+            today = datetime.date.today()
+            current_day = today.weekday()
+            days_ahead = (target_day - current_day) % 7
+            if days_ahead == 0:
+                days_ahead = 7  # If today is the day, schedule for next week
+            
+            next_date = today + datetime.timedelta(days=days_ahead)
+            next_datetime = datetime.datetime.combine(
+                next_date, 
+                datetime.time(hour, minute)
+            )
+            result["next_due"] = next_datetime.isoformat()
+        
+        # Remove pattern from content
+        result["content"] = re.sub(r'\s*every-\w+-\d{1,2}:\d{2}', '', text, flags=re.IGNORECASE).strip()
+        return result
+    
+    # Pattern 2: every-day or daily
+    if re.search(r'every-day|daily', text, re.IGNORECASE):
+        result["type"] = "recurring"
+        result["frequency"] = "daily"
+        result["next_due"] = datetime.date.today().isoformat()
+        result["content"] = re.sub(r'every-day|daily', '', text, flags=re.IGNORECASE).strip()
+        return result
+    
+    # Pattern 3: every-[number]-[unit] (e.g., "every-2-weeks", "every-3-days")
+    every_interval = re.search(r'every-(\d+)-(\w+)', text, re.IGNORECASE)
+    if every_interval:
+        number = int(every_interval.group(1))
+        unit = every_interval.group(2).lower()
+        
+        result["type"] = "recurring"
+        result["frequency"] = f"every-{number}-{unit}"
+        
+        # Calculate next due
+        today = datetime.date.today()
+        if unit in ["day", "days"]:
+            next_date = today + datetime.timedelta(days=number)
+        elif unit in ["week", "weeks"]:
+            next_date = today + datetime.timedelta(weeks=number)
+        elif unit in ["month", "months"]:
+            next_date = today + datetime.timedelta(days=30*number)
+        else:
+            next_date = today
+        
+        result["next_due"] = next_date.isoformat()
+        result["content"] = re.sub(r'every-\d+-\w+', '', text, flags=re.IGNORECASE).strip()
+        return result
+    
+    # Pattern 4: in-[number]-[unit] (e.g., "in-2-weeks", "in-3-days")
+    in_future = re.search(r'in-(\d+)-(\w+)', text, re.IGNORECASE)
+    if in_future:
+        number = int(in_future.group(1))
+        unit = in_future.group(2).lower()
+        
+        result["type"] = "future"
+        today = datetime.date.today()
+        
+        if unit in ["day", "days"]:
+            deadline_date = today + datetime.timedelta(days=number)
+        elif unit in ["week", "weeks"]:
+            deadline_date = today + datetime.timedelta(weeks=number)
+        elif unit in ["month", "months"]:
+            deadline_date = today + datetime.timedelta(days=30*number)
+        else:
+            deadline_date = today
+        
+        result["deadline"] = deadline_date.isoformat()
+        result["next_due"] = deadline_date.isoformat()
+        result["content"] = re.sub(r'in-\d+-\w+', '', text, flags=re.IGNORECASE).strip()
+        return result
+    
+    # Pattern 5: deadline:[date] (e.g., "deadline:2025-02-28")
+    deadline_match = re.search(r'deadline[:\s]+(\d{4}-\d{2}-\d{2})', text, re.IGNORECASE)
+    if deadline_match:
+        deadline_str = deadline_match.group(1)
+        result["deadline"] = deadline_str
+        result["content"] = re.sub(r'deadline[:\s]*\d{4}-\d{2}-\d{2}', '', text, flags=re.IGNORECASE).strip()
+        return result
+    
+    # Pattern 6: priority:[high|medium|low]
+    priority_match = re.search(r'priority[:=]\s*(high|medium|low)', text, re.IGNORECASE)
+    if priority_match:
+        result["priority"] = priority_match.group(1).lower()
+        result["content"] = re.sub(r'priority[:=]\s*(high|medium|low)', '', text, flags=re.IGNORECASE).strip()
+    
+    # Remove all tag: patterns from content
+    result["content"] = re.sub(r'\s*tag:\w+', '', result["content"], flags=re.IGNORECASE).strip()
+    
+    return result
+
+def calculate_urgency_score(todo):
+    """
+    Calculate urgency score (0-100) based on:
+    - Frequency: How often task repeats (40% weight)
+    - Deadline proximity: Days until deadline (60% weight)
+    """
+    frequency_score = 0
+    deadline_score = 0
+    
+    # Frequency scoring (0-100)
+    frequency_map = {
+        "daily": 100,
+        "every-1-day": 100,
+        "every-monday": 70,
+        "every-tuesday": 70,
+        "every-wednesday": 70,
+        "every-thursday": 70,
+        "every-friday": 80,
+        "every-saturday": 50,
+        "every-sunday": 50,
+        "every-1-week": 70,
+        "every-2-week": 50,
+        "every-1-month": 30,
+    }
+    
+    if todo["type"] == "recurring" and todo["frequency"]:
+        for key, score in frequency_map.items():
+            if key in todo["frequency"].lower():
+                frequency_score = score
+                break
+    
+    # Deadline proximity scoring (0-100)
+    if todo.get("deadline") or todo.get("next_due"):
+        deadline_str = todo.get("deadline") or todo.get("next_due")
+        try:
+            deadline_date = datetime.datetime.fromisoformat(deadline_str).date()
+            days_until = (deadline_date - datetime.date.today()).days
+            
+            if days_until <= 0:
+                deadline_score = 100  # Overdue
+            elif days_until <= 1:
+                deadline_score = 95
+            elif days_until <= 3:
+                deadline_score = 80
+            elif days_until <= 7:
+                deadline_score = 60
+            elif days_until <= 14:
+                deadline_score = 40
+            elif days_until <= 30:
+                deadline_score = 20
+            else:
+                deadline_score = 5
+        except:
+            deadline_score = 0
+    
+    # Weighted average: 40% frequency + 60% deadline
+    urgency = (frequency_score * 0.4) + (deadline_score * 0.6)
+    return int(urgency)
 
 # ---------- GOOGLE CALENDAR FUNCTIONS ----------
 def init_google_calendar():
@@ -373,6 +588,7 @@ async def on_ready():
     monthly_summary.start()
     daily_calendar_notification.start()
     weekly_calendar_summary.start()
+    event_reminders.start()
 
 # ---------- DAILY CHECKIN ----------
 last_checkin_date = None
@@ -610,6 +826,79 @@ async def weekly_calendar_summary():
             professional_msg = format_events_message(professional_events, "💼 **Professional Calendar - Next 2 Weeks**")
             await channel.send(professional_msg)
 
+@tasks.loop(minutes=5)
+async def event_reminders():
+    """Check for upcoming events and send reminders 2 hours and 1 hour before"""
+    global sent_reminders
+    
+    now = datetime.datetime.now(TZ)
+    channel = discord.utils.get(bot.get_all_channels(), name=CALENDAR_CHANNEL)
+    if not channel:
+        return
+    
+    # Check both calendars
+    for calendar_id in [PERSONAL_CALENDAR_ID, PROFESSIONAL_CALENDAR_ID]:
+        if not calendar_id:
+            continue
+        
+        try:
+            if not CALENDAR_SERVICE:
+                continue
+            
+            # Get events for next 24 hours
+            start_time = now.isoformat()
+            end_time = (now + datetime.timedelta(hours=24)).isoformat()
+            
+            events_result = CALENDAR_SERVICE.events().list(
+                calendarId=calendar_id,
+                timeMin=start_time,
+                timeMax=end_time,
+                singleEvents=True,
+                orderBy="startTime"
+            ).execute()
+            
+            events = events_result.get("items", [])
+            
+            for event in events:
+                event_id = event.get("id")
+                event_summary = event.get("summary", "Untitled event")
+                start = event.get("start", {})
+                start_time_str = start.get("dateTime", start.get("date"))
+                
+                if not start_time_str:
+                    continue
+                
+                try:
+                    event_dt = dateutil.parser.parse(start_time_str)
+                    
+                    # Check if reminder needed in 2 hours
+                    reminder_2h_key = f"{calendar_id}|{event_id}|2h"
+                    if reminder_2h_key not in sent_reminders:
+                        time_until = event_dt - now
+                        if datetime.timedelta(hours=1, minutes=55) <= time_until <= datetime.timedelta(hours=2, minutes=5):
+                            event_time = event_dt.strftime("%H:%M")
+                            emoji = "💼" if calendar_id == PROFESSIONAL_CALENDAR_ID else "📅"
+                            await channel.send(f"{emoji} **{event_summary}** starts in 2 hours at {event_time}")
+                            sent_reminders.add(reminder_2h_key)
+                    
+                    # Check if reminder needed in 1 hour
+                    reminder_1h_key = f"{calendar_id}|{event_id}|1h"
+                    if reminder_1h_key not in sent_reminders:
+                        time_until = event_dt - now
+                        if datetime.timedelta(minutes=55) <= time_until <= datetime.timedelta(hours=1, minutes=5):
+                            event_time = event_dt.strftime("%H:%M")
+                            emoji = "💼" if calendar_id == PROFESSIONAL_CALENDAR_ID else "📅"
+                            await channel.send(f"{emoji} ⏰ **{event_summary}** starts in 1 hour at {event_time}")
+                            sent_reminders.add(reminder_1h_key)
+                    
+                except Exception as e:
+                    print(f"Error processing event reminder: {e}")
+                    continue
+        
+        except Exception as e:
+            print(f"Error fetching events for reminders: {e}")
+            continue
+
 # ---------- MONTHLY SUMMARY ----------
 @tasks.loop(hours=1)
 async def monthly_summary():
@@ -657,25 +946,84 @@ async def on_message(message):
         return
 
     if message.channel.name == TODO_CHANNEL:
-        # Parse deadline if present
-        deadline = None
-        content = message.content
+        # Parse the todo input
+        parsed = parse_todo_input(message.content)
         
-        if "| due" in content.lower():
-            content, due = content.split("|", 1)
-            due = due.replace("due", "").strip()
-            try:
-                deadline = datetime.datetime.fromisoformat(due).date().isoformat()
-            except:
-                deadline = None
-        
-        content = content.strip()
-        add_todo(content, deadline=deadline)
+        add_todo(
+            content=parsed["content"],
+            deadline=parsed["deadline"],
+            todo_type=parsed["type"],
+            frequency=parsed["frequency"],
+            priority=parsed["priority"],
+            tags=parsed["tags"]
+        )
         await message.add_reaction("⏳")
 
     await bot.process_commands(message)
 
 # ---------- COMMANDS ----------
+
+@bot.command(name="todos")
+async def show_todos(ctx, tag: str = None):
+    """Show all pending todos sorted by urgency. Usage: !todos or !todos:perso or !todos:pro"""
+    # Handle command invocation like !todos:perso
+    if ctx.invoked_subcommand is None:
+        # Check if tag was passed via context invoke
+        if tag:
+            tag = tag.lower()
+    
+    todos = get_todos(status="pending", tag=tag)
+    
+    if not todos:
+        tag_str = f" with tag '{tag}'" if tag else ""
+        await ctx.send(f"✅ No pending todos{tag_str}!")
+        return
+    
+    # Calculate urgency for each todo
+    todos_with_urgency = []
+    for todo in todos:
+        urgency = calculate_urgency_score(todo)
+        todos_with_urgency.append((todo, urgency))
+    
+    # Sort by urgency (highest first)
+    todos_with_urgency.sort(key=lambda x: x[1], reverse=True)
+    
+    # Format message
+    tag_str = f" - {tag.upper()}" if tag else ""
+    msg = f"📋 **Your Todos{tag_str} (by urgency)**\n\n"
+    
+    for idx, (todo, urgency) in enumerate(todos_with_urgency, 1):
+        # Urgency emoji
+        if urgency >= 80:
+            urgency_emoji = "🔴"
+        elif urgency >= 50:
+            urgency_emoji = "🟡"
+        else:
+            urgency_emoji = "🟢"
+        
+        # Format todo
+        content = todo["content"]
+        todo_type = f"_{todo['type']}_" if todo['type'] != "one-time" else ""
+        
+        if todo["frequency"]:
+            freq = f"\n  ↻ {todo['frequency']}"
+        else:
+            freq = ""
+        
+        if todo["deadline"]:
+            deadline = f"\n  📅 Due: {todo['deadline']}"
+        else:
+            deadline = ""
+        
+        # Format tags
+        if todo["tags"]:
+            tags_str = f"\n  🏷️ {', '.join([f'`{t}`' for t in todo['tags']])}"
+        else:
+            tags_str = ""
+        
+        msg += f"{urgency_emoji} **{idx}. {content}** `({urgency})`{freq}{deadline}{tags_str}\n"
+    
+    await ctx.send(msg)
 
 @bot.command(name="addevent")
 async def add_event(ctx, *, event_input):
