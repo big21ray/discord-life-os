@@ -586,9 +586,12 @@ async def on_ready():
     daily_reset.start()
     weekly_summary.start()
     monthly_summary.start()
-    event_reminders.start()
-    daily_calendar_notification.start()
-    weekly_calendar_summary.start()
+    if not event_reminders.is_running():
+        event_reminders.start()
+    if not daily_calendar_notification.is_running():
+        daily_calendar_notification.start()
+    if not weekly_calendar_summary.is_running():
+        weekly_calendar_summary.start()
     event_reminders.start()
 
 # ---------- DAILY CHECKIN ----------
