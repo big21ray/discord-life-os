@@ -51,6 +51,9 @@ PROFESSIONAL_CALENDAR_ID = os.getenv("PROFESSIONAL_CALENDAR_ID")
 CALENDAR_CHANNEL = "calendar-events"
 CALENDAR_CHANNEL_ID = 1452167083402985563
 
+# Discord channel where professional commands (like !add_scrim) should be used
+PROFESSIONAL_CHANNEL_ID = int(os.getenv("PROFESSIONAL_CHANNEL_ID", "1455622941705507008"))
+
 
 def get_calendar_channel():
     """Resolve the calendar channel.
@@ -555,7 +558,7 @@ def parse_event_input(text):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-def add_calendar_event(calendar_id, title, event_datetime):
+def add_calendar_event(calendar_id, title, event_datetime, duration_hours=1):
     """Add event to Google Calendar"""
     if not CALENDAR_SERVICE:
         return {"success": False, "error": "Calendar service not initialized"}
@@ -568,7 +571,7 @@ def add_calendar_event(calendar_id, title, event_datetime):
                 "timeZone": "Europe/Paris"
             },
             "end": {
-                "dateTime": (event_datetime + datetime.timedelta(hours=1)).isoformat(),
+                "dateTime": (event_datetime + datetime.timedelta(hours=duration_hours)).isoformat(),
                 "timeZone": "Europe/Paris"
             }
         }
@@ -1185,6 +1188,119 @@ async def add_event(ctx, *, event_input):
         await ctx.send(f"✅ Event added: **{parsed['title']}** on {event_time}")
     else:
         await ctx.send(f"❌ Error adding event: {result['error']}")
+
+
+@bot.command(name="add_scrim")
+async def add_scrim(ctx, *, args: str):
+    """Add a 6-hour scrim event to the professional calendar.
+
+        Usage: !add_scrim TEAM DD-MM HH.MM [AM|PM] stream|no_stream
+        Examples:
+            !add_scrim KC 30-12 3.30 stream
+            !add_scrim KC 30-12 3.30 PM no_stream
+    """
+    if PROFESSIONAL_CHANNEL_ID and ctx.channel.id != PROFESSIONAL_CHANNEL_ID:
+        await ctx.send(f"❌ Use this command in <#{PROFESSIONAL_CHANNEL_ID}>.")
+        return
+
+    if not PROFESSIONAL_CALENDAR_ID:
+        await ctx.send("❌ Professional calendar not configured (PROFESSIONAL_CALENDAR_ID missing)")
+        return
+
+    parts = args.split()
+    date_idx = None
+    for i, part in enumerate(parts):
+        if re.fullmatch(r"\d{1,2}-\d{1,2}", part):
+            date_idx = i
+            break
+
+    if date_idx is None or date_idx == 0:
+        await ctx.send("❌ Usage: !add_scrim TEAM DD-MM HH.MM [AM|PM] stream|no_stream")
+        return
+    if date_idx + 1 >= len(parts):
+        await ctx.send("❌ Usage: !add_scrim TEAM DD-MM HH.MM [AM|PM] stream|no_stream")
+        return
+
+    team = " ".join(parts[:date_idx]).strip()
+    date_token = parts[date_idx]
+    time_token_raw = parts[date_idx + 1]
+
+    # Optional AM/PM token after time (ignored)
+    stream_token_idx = date_idx + 2
+    if stream_token_idx < len(parts) and parts[stream_token_idx].lower() in {"am", "pm"}:
+        stream_token_idx += 1
+
+    if stream_token_idx >= len(parts):
+        await ctx.send("❌ Usage: !add_scrim TEAM DD-MM HH.MM [AM|PM] stream|no_stream")
+        return
+
+    stream_token = parts[stream_token_idx].lower()
+    if stream_token not in {"stream", "no_stream", "no-stream", "nostream"}:
+        await ctx.send("❌ Missing stream info: add 'stream' or 'no_stream' after the time")
+        return
+
+    can_stream = stream_token == "stream"
+
+    # Some inputs may include AM/PM attached (e.g., 3.30PM); ignore it.
+    time_token = re.sub(r"\s*(am|pm)\s*$", "", time_token_raw, flags=re.IGNORECASE)
+
+    m = re.fullmatch(r"(\d{1,2})[\.:](\d{2})", time_token)
+    if not m:
+        await ctx.send("❌ Time format must be HH.MM (example: 20.20)")
+        return
+
+    try:
+        day_str, month_str = date_token.split("-")
+        day = int(day_str)
+        month = int(month_str)
+        hour = int(m.group(1))
+        minute = int(m.group(2))
+
+        # Scrim start time is always between 10:00 AM and 6:00 PM.
+        # Interpretation rules:
+        # - 10.xx, 11.xx => AM (10:xx, 11:xx)
+        # - 12.xx => noon hour (12:xx)
+        # - 1.xx .. 6.xx => PM (13:xx .. 18:xx)
+        # - 13.xx .. 18.xx => accepted as 24h time
+        if not (0 <= minute <= 59):
+            raise ValueError("Invalid minute")
+        if hour in (10, 11):
+            pass
+        elif hour == 12:
+            pass
+        elif 1 <= hour <= 6:
+            hour += 12
+        elif 13 <= hour <= 18:
+            pass
+        else:
+            raise ValueError("Hour must be between 10.00 AM and 6.00 PM")
+
+        year = 2026
+        target_date = datetime.date(year, month, day)
+
+        start_dt = datetime.datetime(
+            target_date.year, target_date.month, target_date.day, hour, minute, tzinfo=TZ
+        )
+    except Exception:
+        await ctx.send("❌ Invalid date/time. Usage: !add_scrim TEAM DD-MM HH.MM [AM|PM] stream|no_stream")
+        return
+
+    title = f"Scrim vs {team} | {'Can Stream' if can_stream else 'No Stream'}"
+    result = add_calendar_event(PROFESSIONAL_CALENDAR_ID, title, start_dt, duration_hours=6)
+    if not result.get("success"):
+        await ctx.send(f"❌ Error adding scrim: {result.get('error', 'unknown error')}")
+        return
+
+    created = result.get("event", {})
+    link = created.get("htmlLink")
+    when_str = start_dt.strftime("%a, %b %d %Y at %H:%M")
+
+    embed = discord.Embed(title=title)
+    if link:
+        embed.url = link
+    embed.add_field(name="Scheduled for", value=f"`{when_str}`", inline=True)
+    embed.add_field(name="Duration", value="`6 hours`", inline=True)
+    await ctx.send(content=f"✅ Added: {title}", embed=embed)
 
 # ---------- RUN ----------
 
