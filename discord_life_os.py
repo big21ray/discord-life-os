@@ -49,6 +49,23 @@ PERSONAL_CALENDAR_ID = os.getenv("PERSONAL_CALENDAR_ID", "primary")
 PROFESSIONAL_CALENDAR_ID = os.getenv("PROFESSIONAL_CALENDAR_ID")
 
 CALENDAR_CHANNEL = "calendar-events"
+CALENDAR_CHANNEL_ID = 1452167083402985563
+
+
+def get_calendar_channel():
+    """Resolve the calendar channel.
+
+    Prefer explicit channel ID (more reliable across guilds and renames),
+    fallback to channel name.
+    """
+    if CALENDAR_CHANNEL_ID:
+        try:
+            channel = bot.get_channel(int(CALENDAR_CHANNEL_ID))
+            if channel:
+                return channel
+        except Exception:
+            pass
+    return discord.utils.get(bot.get_all_channels(), name=CALENDAR_CHANNEL)
 
 # Google Calendar API
 SCOPES = ['https://www.googleapis.com/auth/calendar']
@@ -62,7 +79,7 @@ HABITS_SHEET = None
 TODOS_SHEET = None
 
 # Event reminder tracking (in-memory, resets on bot restart)
-sent_reminders = set()  # Format: "calendar_id|event_id|hours_before"
+# (kept later near the reminder task implementation)
 # ----------------------------
 
 intents = discord.Intents.default()
@@ -71,9 +88,6 @@ intents.reactions = True
 intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-
-# Track if tasks have been started
-_tasks_started = False
 
 # ---------- GOOGLE SHEETS FUNCTIONS ----------
 def init_google_sheets():
@@ -439,10 +453,15 @@ def init_google_calendar():
             import json
             creds_dict = json.loads(creds_json)
             credentials = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
-        else:
+        elif os.path.exists("google_credentials.json"):
             # Fall back to local file for development
             credentials = Credentials.from_service_account_file(
-                "credentials.json", scopes=SCOPES
+                "google_credentials.json", scopes=SCOPES
+            )
+        else:
+            raise FileNotFoundError(
+                "❌ GOOGLE_CREDENTIALS not set and google_credentials.json not found. "
+                "Please add GOOGLE_CREDENTIALS to your environment variables or place google_credentials.json in the project root."
             )
         service = build("calendar", "v3", credentials=credentials)
         return service
@@ -569,7 +588,7 @@ def add_calendar_event(calendar_id, title, event_datetime):
 # ---------- BOT EVENTS ----------
 @bot.event
 async def on_ready():
-    global CALENDAR_SERVICE, _tasks_started
+    global CALENDAR_SERVICE, sent_startup_test_calendar_reminder
     print(f"✅ Logged in as {bot.user}")
     
     # Initialize Google Sheets
@@ -585,18 +604,50 @@ async def on_ready():
     except Exception as e:
         print(f"⚠️ Google Calendar API failed: {e}")
     
-    # Start tasks only once on first boot
-    if not _tasks_started:
-        _tasks_started = True
-        daily_checkin.start()
-        daily_reset.start()
-        weekly_summary.start()
-        monthly_summary.start()
-        event_reminders.start()
-        daily_calendar_notification.start()
-        weekly_calendar_summary.start()
-        print("✅ All tasks started")
-    event_reminders.start()
+    # Start tasks only if not already running
+    tasks_to_start = [
+        ("daily_checkin", daily_checkin),
+        ("daily_reset", daily_reset),
+        ("weekly_summary", weekly_summary),
+        ("monthly_summary", monthly_summary),
+        ("event_reminders", event_reminders),
+        ("daily_calendar_notification", daily_calendar_notification),
+        ("weekly_calendar_summary", weekly_calendar_summary),
+    ]
+    
+    for task_name, task in tasks_to_start:
+        try:
+            if not task.is_running():
+                task.start()
+                print(f"✅ Started {task_name}")
+        except RuntimeError as e:
+            if "already launched" in str(e):
+                print(f"ℹ️ {task_name} already running")
+            else:
+                print(f"⚠️ Error starting {task_name}: {e}")
+
+    # Optional: send a one-time fake reminder on startup so you can preview formatting.
+    # Enable by setting SEND_TEST_CALENDAR_REMINDER=1
+    try:
+        # enabled = os.getenv("SEND_TEST_CALENDAR_REMINDER", "").strip() in {"1", "true", "True", "yes", "YES"}
+        enabled=False
+        if enabled and not sent_startup_test_calendar_reminder:
+            sent_startup_test_calendar_reminder = True
+            channel = get_calendar_channel()
+            if channel:
+                now = datetime.datetime.now(TZ)
+                date_str = now.strftime("%a, %b %d %Y").replace(" 0", " ")
+                time_str = now.strftime("%H:%M")
+
+                embed = discord.Embed(
+                    title="Test Event (preview)",
+                    url="https://calendar.google.com/calendar/u/0/r",
+                )
+                embed.add_field(name="Scheduled for", value=f"`{date_str} {time_str}`", inline=True)
+                embed.add_field(name="Duration", value="`1 hour`", inline=True)
+                await channel.send(content="Starting in 2 hours: Test Event (preview)", embed=embed)
+    except Exception as e:
+        print(f"⚠️ Failed to send test calendar reminder: {e}")
 
 # ---------- DAILY CHECKIN ----------
 last_checkin_date = None
@@ -765,6 +816,7 @@ async def weekly_summary():
 # ---------- MONTHLY SUMMARY ----------
 last_calendar_date = None
 last_weekly_calendar_date = None
+sent_startup_test_calendar_reminder = False
 
 # ---------- CALENDAR EVENT REMINDERS ----------
 # Track sent reminders to avoid duplicates (format: "event_id_2h" or "event_id_1h" or "event_id_5min")
@@ -776,9 +828,10 @@ async def event_reminders():
     global sent_reminders
     
     now = datetime.datetime.now(TZ)
-    channel = discord.utils.get(bot.get_all_channels(), name=CALENDAR_CHANNEL)
-    
+    channel = get_calendar_channel()
     if not channel:
+        if now.minute == 0:
+            print(f"❌ Channel '{CALENDAR_CHANNEL}' not found")
         return
     
     # Clean up old reminders (older than 6 hours)
@@ -809,35 +862,69 @@ async def check_and_send_reminder(event, calendar_type, calendar_emoji, channel,
             return
         
         event_time = dateutil.parser.parse(start_time_str)
+        if event_time.tzinfo is None:
+            event_time = event_time.replace(tzinfo=TZ)
+        else:
+            event_time = event_time.astimezone(TZ)
+
         time_until_seconds = (event_time - now).total_seconds()
-        time_until_minutes = time_until_seconds / 60
+        if time_until_seconds < 0:
+            return
+        
+        # Calculate event duration
+        end = event.get("end", {})
+        end_time_str = end.get("dateTime", end.get("date"))
+        duration_str = "1 hour"  # default
+        if end_time_str:
+            try:
+                end_time = dateutil.parser.parse(end_time_str)
+                duration_minutes = int((end_time - event_time).total_seconds() / 60)
+                if duration_minutes < 60:
+                    duration_str = f"{duration_minutes} min"
+                else:
+                    hours = duration_minutes // 60
+                    minutes = duration_minutes % 60
+                    if minutes == 0:
+                        duration_str = f"{hours} hour" if hours == 1 else f"{hours} hours"
+                    else:
+                        duration_str = f"{hours}h {minutes}min"
+            except:
+                pass
         
         event_id = event.get("id", "")
         title = event.get("summary", "Untitled")
         time_str = event_time.strftime("%H:%M")
+        date_str = event_time.strftime("%a, %b %d %Y").replace(" 0", " ")
         
-        # Define reminder triggers: (minutes_before, label, emoji)
+        # Define reminder triggers: (threshold_seconds, window_seconds, label, emoji)
         reminders = [
-            (120, "2h", "🕐"),
-            (60, "1h", "⏰"),
-            (5, "5min", "🔔")
+            (120 * 60, 5 * 60, "2 hours"),
+            (60 * 60, 5 * 60, "1 hour"),
+            (5 * 60, 2 * 60, "5 minutes"),
         ]
-        
-        for minutes_threshold, label, emoji in reminders:
-            # Check if within 1 minute window of reminder time
-            if minutes_threshold - 1 <= time_until_minutes <= minutes_threshold:
+
+        for threshold_seconds, window_seconds, label in reminders:
+            # Allow a small late window (task loops may drift).
+            if (threshold_seconds - window_seconds) <= time_until_seconds <= threshold_seconds:
                 reminder_key = f"{event_id}_{label}"
                 
                 # Only send if not already sent
                 if reminder_key not in sent_reminders:
                     sent_reminders[reminder_key] = now
-                    
-                    msg = f"{emoji} **{label}** until event\n{calendar_emoji} **{calendar_type.upper()}**\n📌 **{title}**\n⏰ {time_str}"
-                    await channel.send(msg)
+
+                    # Discord doesn't reliably support masked links in plain messages.
+                    # Use an embed so the title is clickable.
+                    event_url = event.get("htmlLink")
+                    embed = discord.Embed(title=title)
+                    if event_url:
+                        embed.url = event_url
+                    embed.add_field(name="Scheduled for", value=f"`{date_str} {time_str}`", inline=True)
+                    embed.add_field(name="Duration", value=f"`{duration_str}`", inline=True)
+                    await channel.send(content=f"Starting in {label}: {title}", embed=embed)
     except Exception as e:
         print(f"Error checking reminder: {e}")
 
-@tasks.loop(hours=1)
+@tasks.loop(minutes=1)
 async def daily_calendar_notification():
     """Send daily summary of calendar events for next 2 days at 9:00 AM"""
     global last_calendar_date
@@ -850,14 +937,14 @@ async def daily_calendar_notification():
         print(f"🕐 Daily calendar check: {now.strftime('%H:%M %Z')} | Today: {today}")
     
     if (
-        now.hour == CHECKIN_HOUR
-        and now.minute == CHECKIN_MINUTE
+        now.hour == CALENDAR_HOUR
+        and now.minute == CALENDAR_MINUTE
         and last_calendar_date != today
     ):
         last_calendar_date = today
         print(f"✅ Sending daily calendar summary at {now.strftime('%H:%M %Z')}")
         
-        channel = discord.utils.get(bot.get_all_channels(), name=CALENDAR_CHANNEL)
+        channel = get_calendar_channel()
         if not channel:
             print(f"❌ Channel '{CALENDAR_CHANNEL}' not found")
             return
@@ -877,7 +964,7 @@ async def daily_calendar_notification():
             professional_msg = format_events_message(professional_events, "💼 **Professional Calendar - Next 2 Days**")
             await channel.send(professional_msg)
 
-@tasks.loop(hours=1)
+@tasks.loop(minutes=1)
 async def weekly_calendar_summary():
     """Send full calendar for next 2 weeks every Monday at 9:00 AM"""
     global last_weekly_calendar_date
@@ -899,7 +986,7 @@ async def weekly_calendar_summary():
         last_weekly_calendar_date = today
         print(f"✅ Sending weekly calendar reminder at {now.strftime('%H:%M %Z')}")
         
-        channel = discord.utils.get(bot.get_all_channels(), name=CALENDAR_CHANNEL)
+        channel = get_calendar_channel()
         if not channel:
             print(f"❌ Channel '{CALENDAR_CHANNEL}' not found")
             return
@@ -917,78 +1004,23 @@ async def weekly_calendar_summary():
             professional_msg = format_events_message(professional_events, "💼 **Professional Calendar - Next 2 Weeks**")
             await channel.send(professional_msg)
 
-@tasks.loop(minutes=5)
-async def event_reminders():
-    """Check for upcoming events and send reminders 2 hours and 1 hour before"""
-    global sent_reminders
-    
-    now = datetime.datetime.now(TZ)
-    channel = discord.utils.get(bot.get_all_channels(), name=CALENDAR_CHANNEL)
-    if not channel:
-        return
-    
-    # Check both calendars
-    for calendar_id in [PERSONAL_CALENDAR_ID, PROFESSIONAL_CALENDAR_ID]:
-        if not calendar_id:
-            continue
-        
-        try:
-            if not CALENDAR_SERVICE:
-                continue
-            
-            # Get events for next 24 hours
-            start_time = now.isoformat()
-            end_time = (now + datetime.timedelta(hours=24)).isoformat()
-            
-            events_result = CALENDAR_SERVICE.events().list(
-                calendarId=calendar_id,
-                timeMin=start_time,
-                timeMax=end_time,
-                singleEvents=True,
-                orderBy="startTime"
-            ).execute()
-            
-            events = events_result.get("items", [])
-            
-            for event in events:
-                event_id = event.get("id")
-                event_summary = event.get("summary", "Untitled event")
-                start = event.get("start", {})
-                start_time_str = start.get("dateTime", start.get("date"))
-                
-                if not start_time_str:
-                    continue
-                
-                try:
-                    event_dt = dateutil.parser.parse(start_time_str)
-                    
-                    # Check if reminder needed in 2 hours
-                    reminder_2h_key = f"{calendar_id}|{event_id}|2h"
-                    if reminder_2h_key not in sent_reminders:
-                        time_until = event_dt - now
-                        if datetime.timedelta(hours=1, minutes=55) <= time_until <= datetime.timedelta(hours=2, minutes=5):
-                            event_time = event_dt.strftime("%H:%M")
-                            emoji = "💼" if calendar_id == PROFESSIONAL_CALENDAR_ID else "📅"
-                            await channel.send(f"{emoji} **{event_summary}** starts in 2 hours at {event_time}")
-                            sent_reminders.add(reminder_2h_key)
-                    
-                    # Check if reminder needed in 1 hour
-                    reminder_1h_key = f"{calendar_id}|{event_id}|1h"
-                    if reminder_1h_key not in sent_reminders:
-                        time_until = event_dt - now
-                        if datetime.timedelta(minutes=55) <= time_until <= datetime.timedelta(hours=1, minutes=5):
-                            event_time = event_dt.strftime("%H:%M")
-                            emoji = "💼" if calendar_id == PROFESSIONAL_CALENDAR_ID else "📅"
-                            await channel.send(f"{emoji} ⏰ **{event_summary}** starts in 1 hour at {event_time}")
-                            sent_reminders.add(reminder_1h_key)
-                    
-                except Exception as e:
-                    print(f"Error processing event reminder: {e}")
-                    continue
-        
-        except Exception as e:
-            print(f"Error fetching events for reminders: {e}")
-            continue
+
+@bot.command(name="calendarnow")
+async def calendar_now(ctx):
+    """Send the same message as the daily calendar summary (next 2 days), immediately."""
+    personal_events = get_calendar_events(PERSONAL_CALENDAR_ID, days_ahead=2)
+    professional_events = []
+    if PROFESSIONAL_CALENDAR_ID:
+        professional_events = get_calendar_events(PROFESSIONAL_CALENDAR_ID, days_ahead=2)
+
+    personal_msg = format_events_message(personal_events, "📅 **Personal Calendar - Next 2 Days**")
+    await ctx.send(personal_msg)
+
+    if PROFESSIONAL_CALENDAR_ID and professional_events:
+        professional_msg = format_events_message(professional_events, "💼 **Professional Calendar - Next 2 Days**")
+        await ctx.send(professional_msg)
+
+
 
 # ---------- MONTHLY SUMMARY ----------
 @tasks.loop(hours=1)
