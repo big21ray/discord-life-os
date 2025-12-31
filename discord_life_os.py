@@ -743,25 +743,35 @@ async def on_reaction_add(reaction, user):
     
     # Handle individual todo completion (from !todos command)
     if reaction.emoji == "✅" and reaction.message.id in todo_message_map:
-        row_num = todo_message_map[reaction.message.id]
-        update_todo_status(row_num, "done", now_str())
+        todo_content = todo_message_map[reaction.message.id]
         
-        # Extract todo content from message and send confirmation
-        content = reaction.message.content
-        done_channel = discord.utils.get(
-            bot.get_all_channels(), name=DONE_CHANNEL
-        )
-        if done_channel:
-            await done_channel.send(f"✅ {content}")
+        # Find the row number for this todo content
+        all_todos = TODOS_SHEET.get_all_values()
+        row_num = None
+        for row_idx, row in enumerate(all_todos[1:], start=2):
+            if len(row) > 1 and row[1] == todo_content:
+                row_num = row_idx
+                break
+        
+        if row_num:
+            update_todo_status(row_num, "done", now_str())
+            
+            # Extract todo content from message and send confirmation
+            content = reaction.message.content
+            done_channel = discord.utils.get(
+                bot.get_all_channels(), name=DONE_CHANNEL
+            )
+            if done_channel:
+                await done_channel.send(f"✅ {content}")
+            
+            # Edit the message to show it's done (strike through)
+            try:
+                await reaction.message.edit(content=f"~~{content}~~ ✅ **DONE**")
+            except:
+                pass
         
         # Clean up the mapping
         del todo_message_map[reaction.message.id]
-        
-        # Edit the message to show it's done (strike through)
-        try:
-            await reaction.message.edit(content=f"~~{content}~~ ✅ **DONE**")
-        except:
-            pass
     
     # Legacy: Handle todo reactions in the original message (if still used)
     if reaction.message.channel.name == TODO_CHANNEL and reaction.emoji == "✅":
@@ -1199,20 +1209,12 @@ async def show_todos(ctx, tag: str = None):
         
         todo_msg = f"{urgency_emoji} **{content}** `({urgency})`{todo_type}{freq}{deadline}{tags_str}"
         
-        # Find the row number in TODOS_SHEET for this todo
-        all_todos = TODOS_SHEET.get_all_values()
-        row_num = None
-        for row_idx, row in enumerate(all_todos[1:], start=2):
-            if len(row) > 1 and row[1] == content and len(row) > 3 and row[3] == "pending":
-                row_num = row_idx
-                break
-        
         sent_msg = await ctx.send(todo_msg)
         await sent_msg.add_reaction("✅")
         
-        # Store row number for tracking in reaction handler
-        if row_num:
-            todo_message_map[sent_msg.id] = row_num
+        # Store todo content for tracking in reaction handler (simpler approach)
+        # We'll look up the row number when the reaction is added
+        todo_message_map[sent_msg.id] = content
 
 @bot.command(name="addevent")
 async def add_event(ctx, *, event_input):
