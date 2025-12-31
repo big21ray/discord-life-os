@@ -84,6 +84,10 @@ TODOS_SHEET = None
 
 # Event reminder tracking (in-memory, resets on bot restart)
 # (kept later near the reminder task implementation)
+
+# Todo message tracking: maps message_id -> todo_row_number (for individual todo reactions)
+todo_message_map = {}
+
 # ----------------------------
 
 intents = discord.Intents.default()
@@ -727,6 +731,8 @@ async def daily_todo_reminder():
 # ---------- REACTION TRACKING ----------
 @bot.event
 async def on_reaction_add(reaction, user):
+    global todo_message_map
+    
     if user.bot:
         return
 
@@ -735,6 +741,29 @@ async def on_reaction_add(reaction, user):
         add_habit(today_str(), habit, True)
         await log_habit(habit, True)
     
+    # Handle individual todo completion (from !todos command)
+    if reaction.emoji == "✅" and reaction.message.id in todo_message_map:
+        row_num = todo_message_map[reaction.message.id]
+        update_todo_status(row_num, "done", now_str())
+        
+        # Extract todo content from message and send confirmation
+        content = reaction.message.content
+        done_channel = discord.utils.get(
+            bot.get_all_channels(), name=DONE_CHANNEL
+        )
+        if done_channel:
+            await done_channel.send(f"✅ {content}")
+        
+        # Clean up the mapping
+        del todo_message_map[reaction.message.id]
+        
+        # Edit the message to show it's done (strike through)
+        try:
+            await reaction.message.edit(content=f"~~{content}~~ ✅ **DONE**")
+        except:
+            pass
+    
+    # Legacy: Handle todo reactions in the original message (if still used)
     if reaction.message.channel.name == TODO_CHANNEL and reaction.emoji == "✅":
         # Find and update the todo
         todos = get_todos()
@@ -1111,7 +1140,7 @@ async def on_message(message):
 
 @bot.command(name="todos")
 async def show_todos(ctx, tag: str = None):
-    """Show all pending todos sorted by urgency. Usage: !todos or !todos:perso or !todos:pro"""
+    """Show all pending todos sorted by urgency (1-by-1 with reactions). Usage: !todos or !todos:perso or !todos:pro"""
     # Handle command invocation like !todos:perso
     if ctx.invoked_subcommand is None:
         # Check if tag was passed via context invoke
@@ -1134,10 +1163,11 @@ async def show_todos(ctx, tag: str = None):
     # Sort by urgency (highest first)
     todos_with_urgency.sort(key=lambda x: x[1], reverse=True)
     
-    # Format message
+    # Send header
     tag_str = f" - {tag.upper()}" if tag else ""
-    msg = f"📋 **Your Todos{tag_str} (by urgency)**\n\n"
+    await ctx.send(f"📋 **Your Todos{tag_str} (by urgency)**")
     
+    # Send each todo as a separate message with ✅ reaction
     for idx, (todo, urgency) in enumerate(todos_with_urgency, 1):
         # Urgency emoji
         if urgency >= 80:
@@ -1167,9 +1197,22 @@ async def show_todos(ctx, tag: str = None):
         else:
             tags_str = ""
         
-        msg += f"{urgency_emoji} **{idx}. {content}** `({urgency})`{freq}{deadline}{tags_str}\n"
-    
-    await ctx.send(msg)
+        todo_msg = f"{urgency_emoji} **{content}** `({urgency})`{todo_type}{freq}{deadline}{tags_str}"
+        
+        # Find the row number in TODOS_SHEET for this todo
+        all_todos = TODOS_SHEET.get_all_values()
+        row_num = None
+        for row_idx, row in enumerate(all_todos[1:], start=2):
+            if len(row) > 1 and row[1] == content and len(row) > 3 and row[3] == "pending":
+                row_num = row_idx
+                break
+        
+        sent_msg = await ctx.send(todo_msg)
+        await sent_msg.add_reaction("✅")
+        
+        # Store row number for tracking in reaction handler
+        if row_num:
+            todo_message_map[sent_msg.id] = row_num
 
 @bot.command(name="addevent")
 async def add_event(ctx, *, event_input):
