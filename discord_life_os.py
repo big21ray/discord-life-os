@@ -47,6 +47,7 @@ RESET_MINUTE = 30
 # Google Calendar IDs
 PERSONAL_CALENDAR_ID = os.getenv("PERSONAL_CALENDAR_ID", "primary")
 PROFESSIONAL_CALENDAR_ID = os.getenv("PROFESSIONAL_CALENDAR_ID")
+COMPETITIVE_CALENDAR_ID = os.getenv("COMPETITIVE_CALENDAR_ID", "060331564c64fcccb5bf016ca0083db1c76ac904a118b97ca5bb5676beb2ce89@group.calendar.google.com")
 
 CALENDAR_CHANNEL = "calendar-events"
 CALENDAR_CHANNEL_ID = 1452167083402985563
@@ -853,6 +854,12 @@ async def event_reminders():
         professional_events = get_calendar_events(PROFESSIONAL_CALENDAR_ID, days_ahead=1)
         for event in professional_events:
             await check_and_send_reminder(event, "professional", "💼", channel, now)
+    
+    # Check competitive (LPL/LCK) calendar if configured
+    if COMPETITIVE_CALENDAR_ID:
+        competitive_events = get_calendar_events(COMPETITIVE_CALENDAR_ID, days_ahead=1)
+        for event in competitive_events:
+            await check_and_send_reminder(event, "competitive", "🎮", channel, now)
 
 async def check_and_send_reminder(event, calendar_type, calendar_emoji, channel, now):
     """Check if event needs a reminder and send it"""
@@ -952,20 +959,26 @@ async def daily_calendar_notification():
             print(f"❌ Channel '{CALENDAR_CHANNEL}' not found")
             return
         
-        # Get events from both calendars
+        # Get events from all configured calendars
         personal_events = get_calendar_events(PERSONAL_CALENDAR_ID, days_ahead=2)
         professional_events = []
         if PROFESSIONAL_CALENDAR_ID:
             professional_events = get_calendar_events(PROFESSIONAL_CALENDAR_ID, days_ahead=2)
+        competitive_events = []
+        if COMPETITIVE_CALENDAR_ID:
+            competitive_events = get_calendar_events(COMPETITIVE_CALENDAR_ID, days_ahead=2)
         
         # Format messages
         personal_msg = format_events_message(personal_events, "📅 **Personal Calendar - Next 2 Days**")
-        
         await channel.send(personal_msg)
         
         if PROFESSIONAL_CALENDAR_ID and professional_events:
             professional_msg = format_events_message(professional_events, "💼 **Professional Calendar - Next 2 Days**")
             await channel.send(professional_msg)
+        
+        if COMPETITIVE_CALENDAR_ID and competitive_events:
+            competitive_msg = format_events_message(competitive_events, "🎮 **Competitive (LPL/LCK) - Next 2 Days**")
+            await channel.send(competitive_msg)
 
 @tasks.loop(minutes=1)
 async def weekly_calendar_summary():
@@ -994,11 +1007,14 @@ async def weekly_calendar_summary():
             print(f"❌ Channel '{CALENDAR_CHANNEL}' not found")
             return
         
-        # Get events from both calendars for next 14 days
+        # Get events from all configured calendars for next 14 days
         personal_events = get_calendar_events(PERSONAL_CALENDAR_ID, days_ahead=14)
         professional_events = []
         if PROFESSIONAL_CALENDAR_ID:
             professional_events = get_calendar_events(PROFESSIONAL_CALENDAR_ID, days_ahead=14)
+        competitive_events = []
+        if COMPETITIVE_CALENDAR_ID:
+            competitive_events = get_calendar_events(COMPETITIVE_CALENDAR_ID, days_ahead=14)
         
         personal_msg = format_events_message(personal_events, "📅 **Personal Calendar - Next 2 Weeks**")
         await channel.send(personal_msg)
@@ -1006,6 +1022,10 @@ async def weekly_calendar_summary():
         if PROFESSIONAL_CALENDAR_ID and professional_events:
             professional_msg = format_events_message(professional_events, "💼 **Professional Calendar - Next 2 Weeks**")
             await channel.send(professional_msg)
+        
+        if COMPETITIVE_CALENDAR_ID and competitive_events:
+            competitive_msg = format_events_message(competitive_events, "🎮 **Competitive (LPL/LCK) - Next 2 Weeks**")
+            await channel.send(competitive_msg)
 
 
 @bot.command(name="calendarnow")
