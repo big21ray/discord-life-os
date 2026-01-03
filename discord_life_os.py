@@ -1,6 +1,7 @@
 import discord
 from discord.ext import commands, tasks
 import gspread
+import sqlite3
 import datetime
 import os
 from dotenv import load_dotenv
@@ -20,11 +21,8 @@ TZ = ZoneInfo("Europe/Paris")
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-HABITS = {
-    "🚶‍♂️": "walk",
-    "🪥": "teeth",
-    "🍳": "cook"
-}
+# HABITS will be loaded from Google Sheets (initialized later)
+HABITS = {}  # Format: {emoji: habit_name}
 
 CHECKIN_CHANNEL = "daily-checkin"
 HABIT_LOG_CHANNEL = "habits-log"
@@ -55,6 +53,43 @@ CALENDAR_CHANNEL_ID = 1452167083402985563
 # Discord channel where professional commands (like !add_scrim) should be used
 PROFESSIONAL_CHANNEL_ID = int(os.getenv("PROFESSIONAL_CHANNEL_ID", "1455622941705507008"))
 
+# Project Management Configuration
+PROJECTS = {
+    "project1": {
+        "name": "Project 1",
+        "channel_id": 1457103401560178993,
+    },
+    "project2": {
+        "name": "Project 2",
+        "channel_id": 1457103590043816250,
+    },
+    "project3": {
+        "name": "Project 3",
+        "channel_id": 1457103753936113694,
+    },
+    "project4": {
+        "name": "Project 4",
+        "channel_id": 1457104352228675859,
+    },
+}
+
+# Initialize SQLite for projects/tickets
+projects_db = sqlite3.connect("projects.db", check_same_thread=False)
+projects_cursor = projects_db.cursor()
+
+# Create tables
+projects_cursor.execute("""
+CREATE TABLE IF NOT EXISTS tickets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT,
+    title TEXT,
+    status TEXT,
+    created_at TEXT,
+    completed_at TEXT
+)
+""")
+projects_db.commit()
+
 
 def get_calendar_channel():
     """Resolve the calendar channel.
@@ -81,6 +116,7 @@ SHEET_ID = os.getenv("GOOGLE_SHEETS_ID")
 SHEETS_CLIENT = None
 HABITS_SHEET = None
 TODOS_SHEET = None
+HABITS_CONFIG_SHEET = None
 
 # Event reminder tracking (in-memory, resets on bot restart)
 # (kept later near the reminder task implementation)
@@ -100,7 +136,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # ---------- GOOGLE SHEETS FUNCTIONS ----------
 def init_google_sheets():
     """Initialize Google Sheets connection"""
-    global SHEETS_CLIENT, HABITS_SHEET, TODOS_SHEET
+    global SHEETS_CLIENT, HABITS_SHEET, TODOS_SHEET, HABITS_CONFIG_SHEET, HABITS
     try:
         # Try to load from environment variable first (Railway)
         creds_json = os.getenv("GOOGLE_CREDENTIALS")
@@ -131,14 +167,77 @@ def init_google_sheets():
         try:
             TODOS_SHEET = spreadsheet.worksheet("todos")
         except gspread.exceptions.WorksheetNotFound:
-            TODOS_SHEET = spreadsheet.add_worksheet(title="todos", rows=1000, cols=11)
-            TODOS_SHEET.append_row(["id", "content", "status", "created_at", "completed_at", "deadline", "type", "frequency", "next_due", "priority", "tags"])
+            TODOS_SHEET = spreadsheet.add_worksheet(title="todos", rows=1000, cols=12)
+            TODOS_SHEET.append_row(["id", "content", "status", "completed", "created_at", "completed_at", "deadline", "type", "frequency", "next_due", "priority", "tags"])
+        
+        try:
+            HABITS_CONFIG_SHEET = spreadsheet.worksheet("habits_config")
+        except gspread.exceptions.WorksheetNotFound:
+            HABITS_CONFIG_SHEET = spreadsheet.add_worksheet(title="habits_config", rows=100, cols=2)
+            HABITS_CONFIG_SHEET.append_row(["emoji", "name"])
+            # Add default habits
+            HABITS_CONFIG_SHEET.append_row(["🚶‍♂️", "walk"])
+            HABITS_CONFIG_SHEET.append_row(["🪥", "teeth"])
+            HABITS_CONFIG_SHEET.append_row(["🍳", "cook"])
+        
+        # Load habits from config
+        load_habits_from_config()
         
         print("✅ Google Sheets initialized successfully")
         return True
     except Exception as e:
         print(f"❌ Error initializing Google Sheets: {e}")
         return False
+
+def load_habits_from_config():
+    """Load habits from HABITS_CONFIG sheet into HABITS dictionary"""
+    global HABITS, HABITS_CONFIG_SHEET
+    HABITS = {}
+    try:
+        all_rows = HABITS_CONFIG_SHEET.get_all_values()
+        # Skip header row
+        for row in all_rows[1:]:
+            if len(row) >= 2 and row[0] and row[1]:
+                emoji, name = row[0], row[1]
+                HABITS[emoji] = name
+        print(f"✅ Loaded {len(HABITS)} habits from config")
+    except Exception as e:
+        print(f"❌ Error loading habits config: {e}")
+
+def add_habit_to_config(emoji, name):
+    """Add a new habit to the config"""
+    global HABITS, HABITS_CONFIG_SHEET
+    try:
+        # Check if emoji already exists
+        all_rows = HABITS_CONFIG_SHEET.get_all_values()
+        for row in all_rows[1:]:
+            if len(row) >= 1 and row[0] == emoji:
+                return {"success": False, "error": f"Emoji {emoji} already exists"}
+        
+        # Add the new habit
+        HABITS_CONFIG_SHEET.append_row([emoji, name])
+        HABITS[emoji] = name
+        return {"success": True, "emoji": emoji, "name": name}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+def remove_habit_from_config(emoji):
+    """Remove a habit from the config"""
+    global HABITS, HABITS_CONFIG_SHEET
+    try:
+        # Find and delete the row
+        all_rows = HABITS_CONFIG_SHEET.get_all_values()
+        for idx, row in enumerate(all_rows):
+            if len(row) >= 1 and row[0] == emoji:
+                # Use batch_delete to remove the row (gspread doesn't have delete_row)
+                HABITS_CONFIG_SHEET.delete_rows(idx + 1, idx + 1)  # Delete row at position idx+1
+                if emoji in HABITS:
+                    del HABITS[emoji]
+                return {"success": True, "emoji": emoji}
+        
+        return {"success": False, "error": f"Emoji {emoji} not found"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 def add_habit(date_str, habit, completed):
     """Add or update habit in Google Sheets"""
@@ -228,14 +327,15 @@ def add_todo(content, deadline=None, todo_type="one-time", frequency=None, prior
             str(todo_id),
             content,
             "pending",
-            now_str,
+            "0",  # completed (0 = not done, 1 = done)
+            now_str,  # created_at
             "",  # completed_at
             deadline or "",
             todo_type,
             frequency or "",
             "",  # next_due
             priority,
-            tags_str  # New tags column
+            tags_str
         ])
     except Exception as e:
         print(f"Error adding todo: {e}")
@@ -243,9 +343,15 @@ def add_todo(content, deadline=None, todo_type="one-time", frequency=None, prior
 def update_todo_status(row_num, status, completed_at=None):
     """Update todo status in Google Sheets"""
     try:
-        TODOS_SHEET.update_cell(row_num, 3, status)
-        if completed_at:
-            TODOS_SHEET.update_cell(row_num, 5, completed_at)
+        TODOS_SHEET.update_cell(row_num, 3, status)  # status column
+        
+        # Update completed flag (0 or 1)
+        if status == "done":
+            TODOS_SHEET.update_cell(row_num, 4, "1")  # completed = 1
+            if completed_at:
+                TODOS_SHEET.update_cell(row_num, 6, completed_at)  # completed_at column
+        else:
+            TODOS_SHEET.update_cell(row_num, 4, "0")  # completed = 0
     except Exception as e:
         print(f"Error updating todo: {e}")
 
@@ -828,9 +934,18 @@ async def daily_reset():
                 await log_habit(habit, False)
 
 # ---------- WEEKLY SUMMARY ----------
+last_weekly_summary_date = None
+
 @tasks.loop(hours=1)
 async def weekly_summary():
-    if datetime.date.today().weekday() == 6:  # Sunday
+    global last_weekly_summary_date
+    
+    today = datetime.date.today()
+    
+    # Only run once on Sunday
+    if today.weekday() == 6 and last_weekly_summary_date != today:
+        last_weekly_summary_date = today
+        
         channel = discord.utils.get(bot.get_all_channels(), name=WEEKLY_CHANNEL)
         if not channel:
             return
@@ -849,11 +964,7 @@ async def weekly_summary():
             bar = "█" * count + "░" * (7 - count)
             report += f"{emoji} **{habit.capitalize()}**: {count} / 7  {bar}\n"
 
-        channel = discord.utils.get(bot.get_all_channels(), name=WEEKLY_CHANNEL)
-        if not channel:
-            return
-
-        await delete_last_bot_message(channel)
+        # Don't delete old messages, just send a new one
         await channel.send(report)
 
 # ---------- MONTHLY SUMMARY ----------
@@ -1067,6 +1178,41 @@ async def weekly_calendar_summary():
             await channel.send(competitive_msg)
 
 
+@bot.command(name="commands")
+async def commands_help(ctx):
+    """Display all available commands"""
+    help_msg = """
+📚 **Available Commands**
+
+**📅 Calendar Commands:**
+• `!calendarnow` - Show your calendar for the next 2 days
+• `!addevent <title> <date> <time>` - Add a new event to your calendar
+• `!add_scrim <opponent> <date> <time>` - Add a scrim match to your calendar
+
+**✅ Habit Commands:**
+• `!habits` - Show daily habits with reaction-based tracking
+• `!listhabits` - List all configured habits
+• `!addhabits` - Add new habits to track
+• `!removehabits` - Remove habits from tracking
+• `!weeklysummary` - Show habit completion for the past 7 days
+• `!monthlysummary` - Show habit completion for the past 30 days
+
+**📋 Todo Commands:**
+• `!todos` - View your todo list
+
+**🎯 Project Management Commands:**
+• `!tickets` - Show all project tickets
+• `!done` - Show completed tickets
+• `!ongoing` - Show ongoing tickets
+• `!addticket <project> <title>` - Add a new ticket
+• `!closeticket <ticket_id>` - Mark a ticket as complete
+
+**ℹ️ Other:**
+• `!commands` - Display this message
+"""
+    await ctx.send(help_msg)
+
+
 @bot.command(name="calendarnow")
 async def calendar_now(ctx):
     """Send the same message as the daily calendar summary (next 2 days), immediately."""
@@ -1085,10 +1231,18 @@ async def calendar_now(ctx):
 
 
 # ---------- MONTHLY SUMMARY ----------
+last_monthly_summary_date = None
+
 @tasks.loop(hours=1)
 async def monthly_summary():
+    global last_monthly_summary_date
+    
     today_date = datetime.date.today()
-    if today_date.day == 1:
+    
+    # Only run once on the 1st of the month
+    if today_date.day == 1 and last_monthly_summary_date != today_date:
+        last_monthly_summary_date = today_date
+        
         channel = discord.utils.get(bot.get_all_channels(), name=MONTHLY_CHANNEL)
         if not channel:
             return
@@ -1121,7 +1275,7 @@ async def monthly_summary():
                 f"{count} / {days_in_month}  {bar}\n"
             )
 
-        await delete_last_bot_message(channel)
+        # Don't delete old messages, just send a new one
         await channel.send(report)
 
 # ---------- TODO SYSTEM ----------
@@ -1366,6 +1520,311 @@ async def add_scrim(ctx, *, args: str):
     embed.add_field(name="Scheduled for", value=f"`{when_str}`", inline=True)
     embed.add_field(name="Duration", value="`6 hours`", inline=True)
     await ctx.send(content=f"✅ Added: {title}", embed=embed)
+
+# ---------- HABITS COMMAND ----------
+@bot.command(name="habits")
+async def show_habits(ctx):
+    """Display today's habits with reactions to mark completion"""
+    today = today_str()
+    
+    if not HABITS:
+        await ctx.send("❌ No habits configured. Use !addhabits to add some!")
+        return
+    
+    # Build dynamic habits message
+    habits_list = "React to mark as completed:\n"
+    for emoji, name in HABITS.items():
+        habits_list += f"{emoji} {name.capitalize()}\n"
+    
+    msg = await ctx.send(
+        f"🏃 **Daily Habits — {today}**\n\n{habits_list}"
+    )
+    
+    for emoji in HABITS:
+        await msg.add_reaction(emoji)
+
+@bot.command(name="addhabits")
+async def add_habits(ctx, emoji, *, name):
+    """Add a new habit
+    Usage: !addhabits 🎯 productivity
+    """
+    result = add_habit_to_config(emoji, name)
+    if result["success"]:
+        await ctx.send(f"✅ Added habit: {emoji} **{name}**")
+    else:
+        await ctx.send(f"❌ Error: {result['error']}")
+
+@bot.command(name="removehabits")
+async def remove_habits(ctx, emoji):
+    """Remove a habit
+    Usage: !removehabits 🎯
+    """
+    result = remove_habit_from_config(emoji)
+    if result["success"]:
+        # Reload habits from Google Sheets to ensure consistency
+        load_habits_from_config()
+        await ctx.send(f"✅ Removed habit: {emoji}")
+    else:
+        await ctx.send(f"❌ Error: {result['error']}")
+
+@bot.command(name="listhabits")
+async def list_habits(ctx):
+    """Show all configured habits with reactions (one message per habit)"""
+    if not HABITS:
+        await ctx.send("❌ No habits configured yet. Use !addhabits to add one!")
+        return
+    
+    for emoji, name in HABITS.items():
+        msg = await ctx.send(f"{emoji} {name.capitalize()}")
+        await msg.add_reaction(emoji)
+
+# ---------- SUMMARY COMMANDS ----------
+@bot.command(name="weeklysummary")
+async def weekly_summary_cmd(ctx):
+    """Show weekly habit summary (past 7 days)"""
+    try:
+        habits_data = HABITS_SHEET.get_all_values()[1:]  # Skip header
+        
+        if not habits_data:
+            await ctx.send("📊 No habit data yet!")
+            return
+        
+        # Get last 7 days
+        today = datetime.date.today()
+        week_start = today - datetime.timedelta(days=6)
+        
+        # Create a dict of habits completed this week (only active habits)
+        habit_week_data = {}
+        for row in habits_data:
+            if len(row) >= 3:
+                date_str, habit, completed = row[0], row[1], row[2]
+                try:
+                    date_obj = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+                    if week_start <= date_obj <= today:
+                        # Only include if habit is currently active
+                        if any(habit == name for name in HABITS.values()):
+                            if habit not in habit_week_data:
+                                habit_week_data[habit] = []
+                            habit_week_data[habit].append(int(completed))
+                except:
+                    pass
+        
+        if not habit_week_data:
+            await ctx.send("📊 No habit data for this week yet!")
+            return
+        
+        # Create summary message
+        msg = "📊 **Weekly Habit Summary (Past 7 Days)**\n\n"
+        
+        for habit, completions in sorted(habit_week_data.items()):
+            # Pad to 7 days
+            while len(completions) < 7:
+                completions.append(0)
+            completions = completions[:7]
+            
+            # Create visual bar
+            bar = ""
+            for completed in completions:
+                bar += "🟩" if completed == 1 else "⬜"
+            
+            # Calculate percentage
+            completed_count = sum(completions)
+            percentage = (completed_count / 7) * 100
+            
+            msg += f"{bar} {habit}: {completed_count}/7 ({percentage:.0f}%)\n"
+        
+        await ctx.send(msg)
+    except Exception as e:
+        await ctx.send(f"❌ Error generating weekly summary: {e}")
+
+@bot.command(name="monthlysummary")
+async def monthly_summary_cmd(ctx):
+    """Show monthly habit summary (past 30 days)"""
+    try:
+        habits_data = HABITS_SHEET.get_all_values()[1:]  # Skip header
+        
+        if not habits_data:
+            await ctx.send("📊 No habit data yet!")
+            return
+        
+        # Get last 30 days
+        today = datetime.date.today()
+        month_start = today - datetime.timedelta(days=29)
+        
+        # Create a dict of habits completed this month (only active habits)
+        habit_month_data = {}
+        for row in habits_data:
+            if len(row) >= 3:
+                date_str, habit, completed = row[0], row[1], row[2]
+                try:
+                    date_obj = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+                    if month_start <= date_obj <= today:
+                        # Only include if habit is currently active
+                        if any(habit == name for name in HABITS.values()):
+                            if habit not in habit_month_data:
+                                habit_month_data[habit] = []
+                            habit_month_data[habit].append(int(completed))
+                except:
+                    pass
+        
+        if not habit_month_data:
+            await ctx.send("📊 No habit data for this month yet!")
+            return
+        
+        # Create summary message
+        msg = "📊 **Monthly Habit Summary (Past 30 Days)**\n\n"
+        
+        for habit, completions in sorted(habit_month_data.items()):
+            # Pad to 30 days
+            while len(completions) < 30:
+                completions.append(0)
+            completions = completions[:30]
+            
+            # Create visual bar (scale to 10 blocks)
+            completed_count = sum(completions)
+            bar_blocks = int((completed_count / 30) * 10)
+            bar = "🟩" * bar_blocks + "⬜" * (10 - bar_blocks)
+            
+            percentage = (completed_count / 30) * 100
+            
+            msg += f"{bar} {habit}: {completed_count}/30 ({percentage:.0f}%)\n"
+        
+        await ctx.send(msg)
+    except Exception as e:
+        await ctx.send(f"❌ Error generating monthly summary: {e}")
+
+# ---------- PROJECT MANAGEMENT COMMANDS ----------
+@bot.command(name="tickets")
+async def show_tickets(ctx):
+    """Display next steps/open tickets for the project"""
+    # Find which project this command is being used in
+    project_id = None
+    for pid, project_info in PROJECTS.items():
+        if project_info["channel_id"] == ctx.channel.id:
+            project_id = pid
+            break
+    
+    if not project_id:
+        await ctx.send("❌ This command only works in project channels")
+        return
+    
+    # Get open tickets for this project
+    projects_cursor.execute(
+        "SELECT id, title FROM tickets WHERE project_id = ? AND status = 'open' ORDER BY id DESC",
+        (project_id,)
+    )
+    tickets = projects_cursor.fetchall()
+    
+    if not tickets:
+        await ctx.send(f"✅ No open tickets for {PROJECTS[project_id]['name']}!")
+        return
+    
+    msg = f"📋 **Open Tickets - {PROJECTS[project_id]['name']}**\n\n"
+    for ticket_id, title in tickets:
+        msg += f"#{ticket_id} • {title}\n"
+    
+    await ctx.send(msg)
+
+@bot.command(name="done")
+async def show_done(ctx):
+    """Display completed tickets for the project"""
+    # Find which project this command is being used in
+    project_id = None
+    for pid, project_info in PROJECTS.items():
+        if project_info["channel_id"] == ctx.channel.id:
+            project_id = pid
+            break
+    
+    if not project_id:
+        await ctx.send("❌ This command only works in project channels")
+        return
+    
+    # Get completed tickets for this project
+    projects_cursor.execute(
+        "SELECT id, title FROM tickets WHERE project_id = ? AND status = 'done' ORDER BY id DESC",
+        (project_id,)
+    )
+    tickets = projects_cursor.fetchall()
+    
+    if not tickets:
+        await ctx.send(f"✅ No completed tickets for {PROJECTS[project_id]['name']}!")
+        return
+    
+    msg = f"✅ **Completed Tickets - {PROJECTS[project_id]['name']}**\n\n"
+    for ticket_id, title in tickets:
+        msg += f"#{ticket_id} • {title}\n"
+    
+    await ctx.send(msg)
+
+@bot.command(name="ongoing")
+async def show_ongoing(ctx):
+    """Show all open tickets across all projects"""
+    projects_cursor.execute(
+        "SELECT project_id, COUNT(*) FROM tickets WHERE status = 'open' GROUP BY project_id"
+    )
+    results = projects_cursor.fetchall()
+    
+    if not results:
+        await ctx.send("✅ All projects are clear - no open tickets!")
+        return
+    
+    msg = "🚀 **Ongoing Tickets Across All Projects**\n\n"
+    for project_id, count in results:
+        project_name = PROJECTS[project_id]["name"]
+        msg += f"**{project_name}**: {count} open ticket(s)\n"
+    
+    await ctx.send(msg)
+
+@bot.command(name="addticket")
+async def add_ticket(ctx, *, title):
+    """Add a new ticket to the project"""
+    # Find which project this command is being used in
+    project_id = None
+    for pid, project_info in PROJECTS.items():
+        if project_info["channel_id"] == ctx.channel.id:
+            project_id = pid
+            break
+    
+    if not project_id:
+        await ctx.send("❌ This command only works in project channels")
+        return
+    
+    # Add ticket to database
+    projects_cursor.execute(
+        "INSERT INTO tickets (project_id, title, status, created_at) VALUES (?, ?, 'open', ?)",
+        (project_id, title, datetime.datetime.now(TZ).isoformat())
+    )
+    projects_db.commit()
+    
+    ticket_id = projects_cursor.lastrowid
+    await ctx.send(f"✅ Added ticket #{ticket_id}: **{title}** to {PROJECTS[project_id]['name']}")
+
+@bot.command(name="closeticket")
+async def close_ticket(ctx, ticket_id: int):
+    """Mark a ticket as done"""
+    # Find which project this command is being used in
+    project_id = None
+    for pid, project_info in PROJECTS.items():
+        if project_info["channel_id"] == ctx.channel.id:
+            project_id = pid
+            break
+    
+    if not project_id:
+        await ctx.send("❌ This command only works in project channels")
+        return
+    
+    # Update ticket status
+    projects_cursor.execute(
+        "UPDATE tickets SET status = 'done', completed_at = ? WHERE id = ? AND project_id = ?",
+        (datetime.datetime.now(TZ).isoformat(), ticket_id, project_id)
+    )
+    projects_db.commit()
+    
+    if projects_cursor.rowcount == 0:
+        await ctx.send(f"❌ Ticket #{ticket_id} not found")
+        return
+    
+    await ctx.send(f"✅ Ticket #{ticket_id} marked as done!")
 
 # ---------- RUN ----------
 
