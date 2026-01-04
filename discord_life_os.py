@@ -117,6 +117,7 @@ SHEETS_CLIENT = None
 HABITS_SHEET = None
 TODOS_SHEET = None
 HABITS_CONFIG_SHEET = None
+TICKETS_SHEET = None
 
 # Event reminder tracking (in-memory, resets on bot restart)
 # (kept later near the reminder task implementation)
@@ -179,6 +180,12 @@ def init_google_sheets():
             HABITS_CONFIG_SHEET.append_row(["🚶‍♂️", "walk"])
             HABITS_CONFIG_SHEET.append_row(["🪥", "teeth"])
             HABITS_CONFIG_SHEET.append_row(["🍳", "cook"])
+        
+        try:
+            TICKETS_SHEET = spreadsheet.worksheet("tickets")
+        except gspread.exceptions.WorksheetNotFound:
+            TICKETS_SHEET = spreadsheet.add_worksheet(title="tickets", rows=1000, cols=6)
+            TICKETS_SHEET.append_row(["id", "project_id", "title", "status", "created_at", "completed_at"])
         
         # Load habits from config
         load_habits_from_config()
@@ -1708,19 +1715,17 @@ async def show_tickets(ctx):
         await ctx.send("❌ This command only works in project channels")
         return
     
-    # Get open tickets for this project
-    projects_cursor.execute(
-        "SELECT id, title FROM tickets WHERE project_id = ? AND status = 'open' ORDER BY id DESC",
-        (project_id,)
-    )
-    tickets = projects_cursor.fetchall()
+    # Get open tickets for this project from Google Sheets
+    all_tickets = TICKETS_SHEET.get_all_values()[1:]  # Skip header
+    open_tickets = [row for row in all_tickets if len(row) >= 4 and row[1] == str(project_id) and row[3] == "open"]
     
-    if not tickets:
+    if not open_tickets:
         await ctx.send(f"✅ No open tickets for {PROJECTS[project_id]['name']}!")
         return
     
     msg = f"📋 **Open Tickets - {PROJECTS[project_id]['name']}**\n\n"
-    for ticket_id, title in tickets:
+    for row in open_tickets:
+        ticket_id, _, title = row[0], row[1], row[2]
         msg += f"#{ticket_id} • {title}\n"
     
     await ctx.send(msg)
@@ -1739,19 +1744,17 @@ async def show_done(ctx):
         await ctx.send("❌ This command only works in project channels")
         return
     
-    # Get completed tickets for this project
-    projects_cursor.execute(
-        "SELECT id, title FROM tickets WHERE project_id = ? AND status = 'done' ORDER BY id DESC",
-        (project_id,)
-    )
-    tickets = projects_cursor.fetchall()
+    # Get completed tickets for this project from Google Sheets
+    all_tickets = TICKETS_SHEET.get_all_values()[1:]  # Skip header
+    done_tickets = [row for row in all_tickets if len(row) >= 4 and row[1] == str(project_id) and row[3] == "done"]
     
-    if not tickets:
+    if not done_tickets:
         await ctx.send(f"✅ No completed tickets for {PROJECTS[project_id]['name']}!")
         return
     
     msg = f"✅ **Completed Tickets - {PROJECTS[project_id]['name']}**\n\n"
-    for ticket_id, title in tickets:
+    for row in done_tickets:
+        ticket_id, _, title = row[0], row[1], row[2]
         msg += f"#{ticket_id} • {title}\n"
     
     await ctx.send(msg)
@@ -1759,17 +1762,21 @@ async def show_done(ctx):
 @bot.command(name="ongoing")
 async def show_ongoing(ctx):
     """Show all open tickets across all projects"""
-    projects_cursor.execute(
-        "SELECT project_id, COUNT(*) FROM tickets WHERE status = 'open' GROUP BY project_id"
-    )
-    results = projects_cursor.fetchall()
+    all_tickets = TICKETS_SHEET.get_all_values()[1:]  # Skip header
     
-    if not results:
+    # Count open tickets per project
+    project_counts = {}
+    for row in all_tickets:
+        if len(row) >= 4 and row[3] == "open":
+            project_id = int(row[1])
+            project_counts[project_id] = project_counts.get(project_id, 0) + 1
+    
+    if not project_counts:
         await ctx.send("✅ All projects are clear - no open tickets!")
         return
     
     msg = "🚀 **Ongoing Tickets Across All Projects**\n\n"
-    for project_id, count in results:
+    for project_id, count in sorted(project_counts.items()):
         project_name = PROJECTS[project_id]["name"]
         msg += f"**{project_name}**: {count} open ticket(s)\n"
     
@@ -1789,14 +1796,20 @@ async def add_ticket(ctx, *, title):
         await ctx.send("❌ This command only works in project channels")
         return
     
-    # Add ticket to database
-    projects_cursor.execute(
-        "INSERT INTO tickets (project_id, title, status, created_at) VALUES (?, ?, 'open', ?)",
-        (project_id, title, datetime.datetime.now(TZ).isoformat())
-    )
-    projects_db.commit()
+    # Get next ticket ID
+    all_tickets = TICKETS_SHEET.get_all_values()[1:]  # Skip header
+    ticket_id = len(all_tickets) + 1
     
-    ticket_id = projects_cursor.lastrowid
+    # Add ticket to Google Sheets
+    TICKETS_SHEET.append_row([
+        str(ticket_id),
+        str(project_id),
+        title,
+        "open",
+        datetime.datetime.now(TZ).isoformat(),
+        ""  # completed_at
+    ])
+    
     await ctx.send(f"✅ Added ticket #{ticket_id}: **{title}** to {PROJECTS[project_id]['name']}")
 
 @bot.command(name="closeticket")
@@ -1813,14 +1826,18 @@ async def close_ticket(ctx, ticket_id: int):
         await ctx.send("❌ This command only works in project channels")
         return
     
-    # Update ticket status
-    projects_cursor.execute(
-        "UPDATE tickets SET status = 'done', completed_at = ? WHERE id = ? AND project_id = ?",
-        (datetime.datetime.now(TZ).isoformat(), ticket_id, project_id)
-    )
-    projects_db.commit()
+    # Find and update the ticket in Google Sheets
+    all_rows = TICKETS_SHEET.get_all_values()
+    ticket_found = False
     
-    if projects_cursor.rowcount == 0:
+    for row_idx, row in enumerate(all_rows[1:], start=2):  # Start from row 2 (skip header)
+        if len(row) >= 4 and row[0] == str(ticket_id) and row[1] == str(project_id):
+            TICKETS_SHEET.update_cell(row_idx, 4, "done")  # Update status to done
+            TICKETS_SHEET.update_cell(row_idx, 6, datetime.datetime.now(TZ).isoformat())  # Update completed_at
+            ticket_found = True
+            break
+    
+    if not ticket_found:
         await ctx.send(f"❌ Ticket #{ticket_id} not found")
         return
     
