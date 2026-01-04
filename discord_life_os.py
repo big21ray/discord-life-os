@@ -793,12 +793,14 @@ async def daily_checkin():
         if not channel:
             return
 
+        # Build the check-in message dynamically from HABITS config
+        habits_text = "React when completed:\n"
+        for emoji, habit_name in HABITS.items():
+            habits_text += f"{emoji} {habit_name}\n"
+        
         msg = await channel.send(
             f"☀️ **Daily Check-in — {today}**\n\n"
-            "React when completed:\n"
-            "🚶‍♂️ Morning walk + water\n"
-            "🪥 Brush teeth\n"
-            "🍳 Cooked a meal today"
+            f"{habits_text}"
         )
 
         for emoji in HABITS:
@@ -1842,6 +1844,76 @@ async def close_ticket(ctx, ticket_id: int):
         return
     
     await ctx.send(f"✅ Ticket #{ticket_id} marked as done!")
+
+# ---------- CHECK-IN & HABITS LOG COMMANDS ----------
+
+@bot.command(name="check-in")
+async def checkin_cmd(ctx):
+    """Display today's check-in with habits to react to"""
+    today = datetime.datetime.now(TZ).date()
+    
+    if not HABITS:
+        await ctx.send("❌ No habits configured. Use !addhabits to add some!")
+        return
+    
+    # Build the check-in message dynamically from HABITS config
+    habits_text = "React when completed:\n"
+    for emoji, habit_name in HABITS.items():
+        habits_text += f"{emoji} {habit_name}\n"
+    
+    msg = await ctx.send(
+        f"☀️ **Daily Check-in — {today}**\n\n"
+        f"{habits_text}"
+    )
+    
+    for emoji in HABITS:
+        await msg.add_reaction(emoji)
+
+@bot.command(name="habits-log")
+async def habits_log_cmd(ctx):
+    """Display the habits log from Google Sheets"""
+    try:
+        all_rows = HABITS_SHEET.get_all_values()
+        
+        if not all_rows or len(all_rows) <= 1:
+            await ctx.send("📝 No habit logs yet!")
+            return
+        
+        # Group by date and show status
+        habits_by_date = {}
+        for row in all_rows[1:]:  # Skip header
+            if len(row) >= 3:
+                date_str, habit, completed = row[0], row[1], row[2]
+                if date_str not in habits_by_date:
+                    habits_by_date[date_str] = []
+                
+                status = "✅" if completed.lower() in ["yes", "true", "1"] else "❌"
+                habits_by_date[date_str].append(f"{status} {habit}")
+        
+        # Display last 7 days (or less if not enough data)
+        sorted_dates = sorted(habits_by_date.keys(), reverse=True)[:7]
+        
+        if not sorted_dates:
+            await ctx.send("📝 No habit logs yet!")
+            return
+        
+        log_text = "📝 **Habits Log**\n\n"
+        for date in sorted_dates:
+            log_text += f"**{date}**\n"
+            for habit_entry in habits_by_date[date]:
+                log_text += f"  {habit_entry}\n"
+            log_text += "\n"
+        
+        # Split into chunks if too long
+        if len(log_text) > 2000:
+            chunks = [log_text[i:i+1900] for i in range(0, len(log_text), 1900)]
+            for chunk in chunks:
+                await ctx.send(chunk)
+        else:
+            await ctx.send(log_text)
+    
+    except Exception as e:
+        await ctx.send(f"❌ Error retrieving habits log: {e}")
 
 # ---------- RUN ----------
 
