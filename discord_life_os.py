@@ -137,7 +137,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # ---------- GOOGLE SHEETS FUNCTIONS ----------
 def init_google_sheets():
     """Initialize Google Sheets connection"""
-    global SHEETS_CLIENT, HABITS_SHEET, TODOS_SHEET, HABITS_CONFIG_SHEET, HABITS
+    global SHEETS_CLIENT, HABITS_SHEET, TODOS_SHEET, HABITS_CONFIG_SHEET, TICKETS_SHEET, HABITS
     try:
         # Try to load from environment variable first (Railway)
         creds_json = os.getenv("GOOGLE_CREDENTIALS")
